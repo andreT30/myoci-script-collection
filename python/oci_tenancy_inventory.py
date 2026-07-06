@@ -3,7 +3,8 @@
 
 The collector uses the OCI CLI Resource Search service in every subscribed
 region.  It writes the common resource attributes as CSV columns and preserves
-all other Resource Search attributes (including tags) in ``metadata_json``.
+all other Resource Search attributes (including tags) in ``metadata_json``. It
+can also extract up to two selected tags into columns during the same run.
 
 Run without arguments for an interactive menu, or use one of these commands:
 
@@ -317,7 +318,9 @@ def parse_tag_selector(value: str) -> TagSelector:
     )
 
 
-def parse_tag_selectors(values: Iterable[str]) -> List[TagSelector]:
+def parse_tag_selectors(
+    values: Iterable[str], maximum: Optional[int] = None
+) -> List[TagSelector]:
     selectors: List[TagSelector] = []
     seen = set()
     for value in values:
@@ -328,6 +331,8 @@ def parse_tag_selectors(values: Iterable[str]) -> List[TagSelector]:
                 selectors.append(selector)
     if not selectors:
         raise ValueError("At least one tag selector is required.")
+    if maximum is not None and len(selectors) > maximum:
+        raise ValueError(f"A maximum of {maximum} tag selectors is allowed.")
     return selectors
 
 
@@ -359,6 +364,37 @@ def extract_tag_value(metadata: Mapping[str, Any], selector: TagSelector) -> str
     if not isinstance(namespace, dict):
         return ""
     return render_tag_value(namespace.get(selector.key))
+
+
+def add_tag_columns(
+    rows: Iterable[Mapping[str, str]], selectors: Sequence[TagSelector]
+) -> List[Dict[str, str]]:
+    output_rows: List[Dict[str, str]] = []
+    for row in rows:
+        output_row = dict(row)
+        try:
+            metadata = json.loads(output_row.get("metadata_json") or "{}")
+        except json.JSONDecodeError as exc:
+            resource_ocid = output_row.get("resource_ocid", "unknown resource")
+            raise ValueError(f"Invalid metadata_json for {resource_ocid}: {exc}") from exc
+        if not isinstance(metadata, dict):
+            resource_ocid = output_row.get("resource_ocid", "unknown resource")
+            raise ValueError(f"metadata_json for {resource_ocid} is not an object.")
+        for selector in selectors:
+            output_row[selector.header] = extract_tag_value(metadata, selector)
+        output_rows.append(output_row)
+    return output_rows
+
+
+def prompt_optional_tag_selectors(maximum: int = 2) -> List[TagSelector]:
+    print("Tag formats: freeform:KEY, defined:NAMESPACE.KEY, system:NAMESPACE.KEY")
+    values: List[str] = []
+    for number in range(1, maximum + 1):
+        value = prompt_value(f"Tag {number} to extract (blank to finish)")
+        if not value:
+            break
+        values.append(value)
+    return parse_tag_selectors(values, maximum=maximum) if values else []
 
 
 def recreate_with_tags(
@@ -416,6 +452,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--tenancy-id", help="Tenancy OCID; omitted by default so it is prompted"
     )
     collect.add_argument("-o", "--output", help="Output CSV path")
+    collect.add_argument(
+        "--tag",
+        action="append",
+        help=(
+            "Tag to extract into the collected CSV (maximum 2); repeat or comma-separate. "
+            "Formats: freeform:KEY, defined:NAMESPACE.KEY, system:NAMESPACE.KEY"
+        ),
+    )
     add_oci_options(collect)
 
     extract = subparsers.add_parser(
@@ -459,6 +503,11 @@ def collect_command(args: argparse.Namespace) -> int:
     if not TENANCY_OCID_RE.match(tenancy_id):
         raise ValueError("--tenancy-id must be a tenancy OCID beginning with 'ocid1.tenancy.'.")
     output = Path(args.output or prompt_value("Output CSV", "oci_tenancy_inventory.csv"))
+    selectors = (
+        parse_tag_selectors(args.tag, maximum=2)
+        if args.tag
+        else prompt_optional_tag_selectors(maximum=2)
+    )
 
     print("Loading subscribed OCI regions...", file=sys.stderr)
     subscriptions = list_region_subscriptions(tenancy_id, args)
@@ -467,9 +516,12 @@ def collect_command(args: argparse.Namespace) -> int:
         raise RuntimeError("No subscribed regions were returned for the tenancy.")
     print(f"Searching {len(regions)} subscribed region(s): {', '.join(regions)}", file=sys.stderr)
     rows, duplicates = collect_rows(tenancy_id, subscriptions, args)
-    write_csv(output, BASE_COLUMNS, rows)
+    rows = add_tag_columns(rows, selectors)
+    fieldnames = [*BASE_COLUMNS, *(selector.header for selector in selectors)]
+    write_csv(output, fieldnames, rows)
     print(
         f"Wrote {len(rows)} resources to {output.expanduser().resolve()} "
+        f"with {len(selectors)} extracted tag column(s) "
         f"({duplicates} duplicate regional search results removed)."
     )
     return 0
