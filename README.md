@@ -36,18 +36,25 @@ chmod +x bash/*.sh python/*.py
 ## Tenancy resource inventory
 
 `python/oci_tenancy_inventory.py` uses OCI Resource Search in every subscribed
-region. The CSV contains:
+region. Every CSV contains `resource_type`, `region`, `lifecycle_state`, and up
+to two tag columns selected during collection. Identifier columns depend on
+`--identifier-format`:
 
-- `resource_ocid`
-- `compartment_id`
-- `resource_type`
-- `region`
-- `lifecycle_state`
-- `metadata_json`
-- Up to two tag columns selected during collection
+| Format | Identifier columns |
+| --- | --- |
+| `ocid` | `resource_ocid`, `compartment_id` |
+| `name` | `resource_name`, `compartment_name` |
+| `both` | All four OCID and name columns |
+
+The default is `ocid`. Use `--metadata include` (the default) to add
+`metadata_json`, or `--metadata exclude` to omit it. Selected tag columns work
+in both cases because tags are extracted before metadata is removed.
 
 OCI Resource Search only returns indexed resources visible to the authenticated
-identity. Regionless OCI resources are reported as `GLOBAL`.
+identity. Regionless OCI resources are reported as `GLOBAL`. Resource names
+come from Search display names; compartment names are resolved through OCI IAM.
+Some resources do not expose a display name, and names are not guaranteed to be
+unique. Use `both` when OCID-level traceability is important.
 
 ### Interactive menu
 
@@ -83,6 +90,31 @@ python3 python/oci_tenancy_inventory.py collect \
   --output oci_tenancy_inventory.csv
 ```
 
+### Collect names instead of OCIDs and omit metadata
+
+The selected tags remain in the CSV even though `metadata_json` is excluded:
+
+```bash
+python3 python/oci_tenancy_inventory.py collect \
+  --tenancy-id ocid1.tenancy.oc1..example \
+  --identifier-format name \
+  --metadata exclude \
+  --tag freeform:Owner \
+  --tag defined:Operations.CostCenter \
+  --output inventory_by_name.csv
+```
+
+### Collect both names and OCIDs with metadata
+
+```bash
+python3 python/oci_tenancy_inventory.py collect \
+  --tenancy-id ocid1.tenancy.oc1..example \
+  --identifier-format both \
+  --metadata include \
+  --tag freeform:Environment \
+  --output inventory_full.csv
+```
+
 Two selectors can also be comma-separated:
 
 ```bash
@@ -110,7 +142,8 @@ python3 python/oci_tenancy_inventory.py collect \
 
 ### Recreate an existing inventory with selected tag columns
 
-The original `metadata_json` column is retained by default:
+The original `metadata_json` column is retained by default. Reprocessing works
+with `ocid`, `name`, and `both` identifier layouts:
 
 ```bash
 python3 python/oci_tenancy_inventory.py extract-tags \
@@ -133,6 +166,10 @@ python3 python/oci_tenancy_inventory.py extract-tags \
   --output inventory_tags_only.csv
 ```
 
+An inventory collected with `--metadata exclude` cannot be used to extract new
+tags later because the source tag data is no longer present. Tags selected
+during that original collection remain available as normal CSV columns.
+
 ### Inventory options
 
 `collect` supports:
@@ -141,6 +178,8 @@ python3 python/oci_tenancy_inventory.py extract-tags \
 | --- | --- |
 | `--tenancy-id OCID` | Tenancy OCID; prompted when omitted |
 | `-o, --output PATH` | Destination CSV; prompted when omitted |
+| `--identifier-format ocid\|name\|both` | Choose OCID columns, name columns, or both; default `ocid` |
+| `--metadata include\|exclude` | Include or omit `metadata_json`; default `include` |
 | `--tag SELECTOR` | Tag to extract; repeat or comma-separate, maximum two |
 | `--profile NAME` | OCI CLI profile |
 | `--config-file PATH` | OCI CLI configuration file |
