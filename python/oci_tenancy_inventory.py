@@ -5,6 +5,7 @@ The collector uses the OCI CLI Resource Search service in every subscribed
 region.  It writes the common resource attributes as CSV columns and preserves
 all other Resource Search attributes (including tags) in ``metadata_json``. It
 can also extract up to two selected tags into columns during the same run.
+Resource and compartment identifiers can be written as OCIDs, names, or both.
 
 Run without arguments for an interactive menu, or use one of these commands:
 
@@ -31,13 +32,23 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
-BASE_COLUMNS = (
+IDENTIFIER_COLUMNS = {
+    "ocid": ("resource_ocid", "compartment_id"),
+    "name": ("resource_name", "compartment_name"),
+    "both": ("resource_ocid", "resource_name", "compartment_id", "compartment_name"),
+}
+IDENTIFIER_COLUMN_ORDER = (
     "resource_ocid",
+    "resource_name",
     "compartment_id",
+    "compartment_name",
+)
+RESOURCE_IDENTIFIER_COLUMNS = ("resource_ocid", "resource_name")
+COMPARTMENT_IDENTIFIER_COLUMNS = ("compartment_id", "compartment_name")
+RESOURCE_DETAIL_COLUMNS = (
     "resource_type",
     "region",
     "lifecycle_state",
-    "metadata_json",
 )
 TENANCY_OCID_RE = re.compile(r"^ocid1\.tenancy\.[^.]+\.[^.]*\..+$")
 COMMON_FIELDS = {
@@ -169,6 +180,45 @@ def list_region_subscriptions(
     return subscriptions
 
 
+def list_compartment_names(tenancy_id: str, args: argparse.Namespace) -> Dict[str, str]:
+    payload = run_oci(
+        [
+            "iam",
+            "compartment",
+            "list",
+            "--compartment-id",
+            tenancy_id,
+            "--compartment-id-in-subtree",
+            "true",
+            "--access-level",
+            "ACCESSIBLE",
+            "--include-root",
+            "--all",
+        ],
+        args,
+        region=args.bootstrap_region,
+    )
+    names: Dict[str, str] = {}
+    for compartment in extract_items(payload):
+        compartment_id = str(get_any(compartment, ("id", "compartment-id", "compartmentId"))).strip()
+        name = str(get_any(compartment, ("name", "display-name", "displayName"))).strip()
+        if compartment_id and name:
+            names[compartment_id] = name
+
+    if tenancy_id not in names:
+        tenancy_payload = run_oci(
+            ["iam", "tenancy", "get", "--tenancy-id", tenancy_id],
+            args,
+            region=args.bootstrap_region,
+        )
+        tenancy = tenancy_payload.get("data", {})
+        if isinstance(tenancy, dict):
+            name = str(get_any(tenancy, ("name", "display-name", "displayName"))).strip()
+            if name:
+                names[tenancy_id] = name
+    return names
+
+
 def subscription_region(subscription: Mapping[str, Any]) -> str:
     return str(get_any(subscription, ("region-name", "regionName"))).strip()
 
@@ -227,17 +277,26 @@ def compact_json(value: Any) -> str:
 
 
 def item_to_row(
-    item: Mapping[str, Any], search_region: str, known_regions: Mapping[str, str]
+    item: Mapping[str, Any],
+    search_region: str,
+    known_regions: Mapping[str, str],
+    compartment_names: Mapping[str, str],
 ) -> Dict[str, str]:
     resource_ocid = str(get_any(item, ("identifier", "resource-id", "resourceId"))).strip()
+    compartment_id = str(
+        get_any(item, ("compartment-id", "compartmentId", "compartment_id"))
+    ).strip()
+    resource_name = str(
+        get_any(item, ("display-name", "displayName", "name"))
+    ).strip()
     metadata = {key: value for key, value in item.items() if key not in COMMON_FIELDS}
     metadata["inventory-search-region"] = search_region
     explicit_region = str(get_any(item, ("region",))).strip()
     return {
         "resource_ocid": resource_ocid,
-        "compartment_id": str(
-            get_any(item, ("compartment-id", "compartmentId", "compartment_id"))
-        ).strip(),
+        "resource_name": resource_name,
+        "compartment_id": compartment_id,
+        "compartment_name": compartment_names.get(compartment_id, ""),
         "resource_type": str(
             get_any(item, ("resource-type", "resourceType", "resource_type"))
         ).strip(),
@@ -252,6 +311,7 @@ def item_to_row(
 def collect_rows(
     tenancy_id: str,
     subscriptions: Sequence[Mapping[str, Any]],
+    compartment_names: Mapping[str, str],
     args: argparse.Namespace,
 ) -> Tuple[List[Dict[str, str]], int]:
     known_regions = region_key_map(subscriptions)
@@ -265,7 +325,7 @@ def collect_rows(
         items = search_region(tenancy_id, region, args)
         print(f"  {len(items)} searchable resources returned", file=sys.stderr)
         for item in items:
-            row = item_to_row(item, region, known_regions)
+            row = item_to_row(item, region, known_regions, compartment_names)
             if not row["resource_ocid"]:
                 continue
             key = (row["resource_ocid"], row["resource_type"])
@@ -397,6 +457,39 @@ def prompt_optional_tag_selectors(maximum: int = 2) -> List[TagSelector]:
     return parse_tag_selectors(values, maximum=maximum) if values else []
 
 
+def collect_fieldnames(
+    identifier_format: str,
+    include_metadata: bool,
+    selectors: Sequence[TagSelector],
+) -> List[str]:
+    fieldnames = [*IDENTIFIER_COLUMNS[identifier_format], *RESOURCE_DETAIL_COLUMNS]
+    if include_metadata:
+        fieldnames.append("metadata_json")
+    fieldnames.extend(selector.header for selector in selectors)
+    return fieldnames
+
+
+def source_inventory_columns(fieldnames: Sequence[str]) -> List[str]:
+    resource_identifiers = [
+        column for column in RESOURCE_IDENTIFIER_COLUMNS if column in fieldnames
+    ]
+    compartment_identifiers = [
+        column for column in COMPARTMENT_IDENTIFIER_COLUMNS if column in fieldnames
+    ]
+    if not resource_identifiers:
+        raise ValueError("Input CSV must contain resource_ocid or resource_name.")
+    if not compartment_identifiers:
+        raise ValueError("Input CSV must contain compartment_id or compartment_name.")
+    missing = [column for column in RESOURCE_DETAIL_COLUMNS if column not in fieldnames]
+    if missing:
+        raise ValueError(f"Input CSV is missing columns: {', '.join(missing)}")
+    return [
+        *(column for column in IDENTIFIER_COLUMN_ORDER if column in fieldnames),
+        *RESOURCE_DETAIL_COLUMNS,
+        "metadata_json",
+    ]
+
+
 def recreate_with_tags(
     source: Path,
     destination: Path,
@@ -407,10 +500,10 @@ def recreate_with_tags(
     with source.expanduser().open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         if not reader.fieldnames or "metadata_json" not in reader.fieldnames:
-            raise ValueError("Input CSV must contain a metadata_json column.")
-        missing = [column for column in BASE_COLUMNS if column not in reader.fieldnames]
-        if missing:
-            raise ValueError(f"Input CSV is missing columns: {', '.join(missing)}")
+            raise ValueError(
+                "Input CSV must contain metadata_json to extract additional tags."
+            )
+        source_columns = source_inventory_columns(reader.fieldnames)
         for line_number, row in enumerate(reader, start=2):
             try:
                 metadata = json.loads(row.get("metadata_json") or "{}")
@@ -418,14 +511,16 @@ def recreate_with_tags(
                 raise ValueError(f"Invalid metadata_json on CSV line {line_number}: {exc}") from exc
             if not isinstance(metadata, dict):
                 raise ValueError(f"metadata_json on CSV line {line_number} is not an object.")
-            output_row = {column: row.get(column, "") for column in BASE_COLUMNS}
+            output_row = {column: row.get(column, "") for column in source_columns}
             for selector in selectors:
                 output_row[selector.header] = extract_tag_value(metadata, selector)
             if not keep_metadata:
                 output_row.pop("metadata_json", None)
             rows.append(output_row)
 
-    fieldnames = [column for column in BASE_COLUMNS if keep_metadata or column != "metadata_json"]
+    fieldnames = [
+        column for column in source_columns if keep_metadata or column != "metadata_json"
+    ]
     fieldnames.extend(selector.header for selector in selectors)
     write_csv(destination, fieldnames, rows)
     return len(rows)
@@ -452,6 +547,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--tenancy-id", help="Tenancy OCID; omitted by default so it is prompted"
     )
     collect.add_argument("-o", "--output", help="Output CSV path")
+    collect.add_argument(
+        "--identifier-format",
+        choices=("ocid", "name", "both"),
+        default="ocid",
+        help="Write resource and compartment identifiers as OCIDs, names, or both",
+    )
+    collect.add_argument(
+        "--metadata",
+        choices=("include", "exclude"),
+        default="include",
+        help="Include or exclude metadata_json from the CSV (default: include)",
+    )
     collect.add_argument(
         "--tag",
         action="append",
@@ -515,13 +622,31 @@ def collect_command(args: argparse.Namespace) -> int:
     if not regions:
         raise RuntimeError("No subscribed regions were returned for the tenancy.")
     print(f"Searching {len(regions)} subscribed region(s): {', '.join(regions)}", file=sys.stderr)
-    rows, duplicates = collect_rows(tenancy_id, subscriptions, args)
+    compartment_names: Dict[str, str] = {}
+    if args.identifier_format in ("name", "both"):
+        print("Resolving compartment names...", file=sys.stderr)
+        compartment_names = list_compartment_names(tenancy_id, args)
+    rows, duplicates = collect_rows(tenancy_id, subscriptions, compartment_names, args)
     rows = add_tag_columns(rows, selectors)
-    fieldnames = [*BASE_COLUMNS, *(selector.header for selector in selectors)]
+    include_metadata = args.metadata == "include"
+    fieldnames = collect_fieldnames(args.identifier_format, include_metadata, selectors)
+    if not include_metadata:
+        for row in rows:
+            row.pop("metadata_json", None)
     write_csv(output, fieldnames, rows)
+    if args.identifier_format in ("name", "both"):
+        unnamed_resources = sum(not row["resource_name"] for row in rows)
+        unnamed_compartments = sum(not row["compartment_name"] for row in rows)
+        if unnamed_resources or unnamed_compartments:
+            print(
+                f"Warning: {unnamed_resources} resource name(s) and "
+                f"{unnamed_compartments} compartment name(s) could not be resolved.",
+                file=sys.stderr,
+            )
     print(
         f"Wrote {len(rows)} resources to {output.expanduser().resolve()} "
-        f"with {len(selectors)} extracted tag column(s) "
+        f"using {args.identifier_format} identifiers, "
+        f"metadata {args.metadata}, and {len(selectors)} extracted tag column(s) "
         f"({duplicates} duplicate regional search results removed)."
     )
     return 0
