@@ -1,0 +1,21 @@
+# macOS metadata
+.DS_Store
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local secrets and environment overrides
+.env
+.env.*
+
+# Locally excluded tests
+/tests/
+
+# Generated OCI reports and payloads
+*.csv
+*.tsv
+resources.json
+bulkedit.json
