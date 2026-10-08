@@ -17,9 +17,15 @@ from .handlers.core import BlockBootVolumes
 from .handlers.network import Networks, NETWORK_OPERATIONS
 from .handlers.storage import Storage
 from .model import CleanupError, Submission
+from .journal import bulk_record_key, bulk_attempt_records, resource_records
 
 IAM_CHUNK_SIZE = 20
 STORAGE_CHUNK_SIZE = 1000
+
+
+class BulkJournalError(CleanupError):
+    """Fatal durable-journal failure; never reinterpret as an OCI outcome."""
+
 _CANDIDATES = frozenset(('Volume','BootVolume','VolumeBackup','BootVolumeBackup',*NETWORK_OPERATIONS))
 _TERMINAL = frozenset(('SUCCEEDED','FAILED','CANCELED'))
 _PENDING = frozenset(('ACCEPTED','IN_PROGRESS','CANCELING'))
@@ -85,35 +91,49 @@ def _journal_context(plan, workspace, state):
 def _persist(workspace, state, nodes, attempt):
     old = deepcopy(state.records)
     try:
+        key = bulk_record_key(attempt['attempt_id'])
+        existing = state.records.get(key)
+        if existing is not None:
+            groups = dict(bulk_attempt_records(state))
+            original = groups.get(key)
+            mutable = {'status','request_id','resource_evidence','resource_status','work_request'}
+            if original is None or {k:v for k,v in original.items() if k not in mutable} != {k:v for k,v in attempt.items() if k not in mutable}:
+                raise CleanupError('Bulk original endpoint and arguments are immutable')
+            if original.get('request_id') and original['request_id'] != attempt.get('request_id'):
+                raise CleanupError('Recorded work request identity is immutable')
+        state.records[key] = {'record_type':'bulk_attempt','attempt':deepcopy(attempt)}
+        reference = {'bulk_attempt':key,'attempt_id':attempt['attempt_id']}
         for node in nodes:
+            if node.key == key:
+                raise CleanupError('Resource identity collides with reserved group journal')
             record = state.records.setdefault(node.key, {'status':'discovered','attempts':[]})
             history = record.setdefault('attempts', [])
             matches = [a for a in history if a.get('attempt_id') == attempt['attempt_id']]
-            if len(matches) > 1:
-                raise CleanupError('Duplicate bulk attempt in journal')
-            if matches:
-                history[history.index(matches[0])] = deepcopy(attempt)
-            else:
-                history.append(deepcopy(attempt))
+            if len(matches)>1 or (matches and matches[0] != reference):
+                raise CleanupError('Conflicting bulk reference in resource history')
+            if not matches:
+                history.append(dict(reference))
         workspace.save_state(state)
-    except Exception:
+    except Exception as error:
         state.records = old
-        raise
+        raise BulkJournalError('Bulk journal persistence failed; stop further operations') from error
 
 
 def _new_attempt(state, nodes, token):
-    if not isinstance(token,str) or not token.strip():
-        raise CleanupError('Bulk requires an explicit attempt token')
-    if any(a.get('attempt_id')==token for record in state.records.values() for a in record.get('attempts',[])):
+    bulk_record_key(token)
+    groups=dict(bulk_attempt_records(state))
+    resources=resource_records(state)  # Validates narrow references once, linearly.
+    if any(a.get('attempt_id')==token for a in groups.values()):
         raise CleanupError('Retry token is already bound to an immutable original group')
+    # Inline direct histories also participate in globally unique attempt tokens.
+    if any(a.get('attempt_id')==token for record in resources.values() for a in record.get('attempts',[])):
+        raise CleanupError('Retry token is already bound to an immutable original action')
     for node in nodes:
-        for attempt in state.records.get(node.key,{}).get('attempts',[]):
-            if attempt.get('attempt_id') == token:
-                raise CleanupError('Existing attempt must be reconciled; blind replay is forbidden')
+        for item in resources.get(node.key,{}).get('attempts',[]):
+            attempt=groups[item['bulk_attempt']] if 'bulk_attempt' in item else item
             if attempt.get('status') not in ('failed','deleted'):
                 raise CleanupError('Previous ambiguous or pending operation must be reconciled first')
-            evidence = attempt.get('resource_status',{}).get(node.key)
-            if evidence != 'failed':
+            if attempt.get('resource_status',{}).get(node.key) != 'failed':
                 raise CleanupError('New action requires established per-resource failure')
 
 
@@ -149,8 +169,6 @@ def submit_bulk(gateway, plan, nodes, attempt_id, *, registry=None, workspace=No
                'status':'attempting','request_id':None,'resource_evidence':{},'resource_status':{}}
     if type(handler) is Storage:
         handler.bind_plan([registry.classify(n) for n in plan.nodes.values()])
-        if handler.batch_group(gateway,safe,scope) is None:
-            raise CleanupError('Fresh Storage batch is ineligible')
         attempt.update(service='object_storage',operation='batch_delete_objects',region=nodes[0].region)
         intent_saved=False
         def before_write(params):
@@ -209,18 +227,20 @@ def _recorded_attempt(plan, state, workspace, request_id):
     durable=state_from_dict(workspace._read('state.json'))
     if state_to_dict(durable) != state_to_dict(state):
         raise CleanupError('In-memory journal differs from durable state')
-    found=[]
-    for record in state.records.values():
-        found.extend(a for a in record.get('attempts',[]) if a.get('request_id')==request_id)
-    if not found or any(a!=found[0] for a in found):
+    found=[(key,a) for key,a in bulk_attempt_records(state) if a.get('request_id')==request_id]
+    if len(found)!=1:
         raise CleanupError('Work request lacks one consistent durable attempt')
-    attempt=deepcopy(found[0])
+    group_key,original=found[0]
+    attempt=deepcopy(original)
     keys=attempt.get('node_keys',[])
     if (attempt.get('service')!='identity' or attempt.get('operation')!='bulk_delete_resources'
             or attempt.get('home_region')!=plan.home_region or attempt.get('region')!=plan.home_region
-            or not keys or len(set(keys))!=len(keys) or len(found)!=len(keys)
             or any(k not in plan.nodes for k in keys)):
         raise CleanupError('Work request original endpoint or group does not match plan')
+    for key in keys:
+        references=[a for a in state.records.get(key,{}).get('attempts',[]) if a.get('bulk_attempt')==group_key]
+        if references != [{'bulk_attempt':group_key,'attempt_id':attempt['attempt_id']}]:
+            raise CleanupError('Resource lacks its exact durable group reference')
     return attempt,[plan.nodes[k] for k in keys]
 
 
@@ -280,6 +300,8 @@ def inspect_bulk(gateway, plan, request_id, *, registry=None, workspace=None, st
                             result['resources'][node.key]='deleted'
                     elif row.get('action_type')=='FAILED':result['resources'][node.key]='failed'
                 if status=='SUCCEEDED' and all(v=='deleted' for v in result['resources'].values()):result['status']='deleted'
+        except BulkJournalError:
+            raise
         except CleanupError:
             pass
         except Exception:

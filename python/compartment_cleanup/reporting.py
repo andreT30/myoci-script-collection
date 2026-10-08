@@ -4,6 +4,7 @@ import json
 
 from .graph import compute_depths
 from .model import Plan, State
+from .journal import resource_records, bulk_attempt_records
 
 
 def _display(value):
@@ -63,7 +64,7 @@ def render_report(plan: Plan, state: State) -> str:
     for probe in plan.probes:
         lines.append(f'  {_display(probe.service)} / {_display(probe.region)} / {_display(probe.compartment_id)}: {_display(probe.status)}; {_display(probe.detail)}')
     lines.extend(['', 'Pending deletions and retained journal records'])
-    records = dict(state.records)
+    records = resource_records(state)
     # Discovery already contains typed service-confirmed schedules. Show them on
     # an initial report before an executor journal has recorded the first read.
     for key, node in plan.nodes.items():
@@ -80,6 +81,13 @@ def render_report(plan: Plan, state: State) -> str:
             lines.append(f'  {_display(key)}: absent from refreshed map; status {_display(record.get("status", "unresolved"))}; authoritative verification required. History preserved.')
             if record.get('errors'):
                 lines.append('    errors: ' + _display(json.dumps(record['errors'], ensure_ascii=False)))
+    groups=list(bulk_attempt_records(state))
+    if groups:
+        lines.extend(['', 'Bulk attempts; IAM configured chunks: 20; Storage maximum group: 1000'])
+        for _,attempt in groups:
+            lines.append(f'  {_display(attempt["attempt_id"])} | {_display(attempt.get("operation", "unknown"))} | status: {_display(attempt.get("status", "unresolved"))}')
+            for key,status in sorted(attempt.get('resource_status',{}).items()):
+                lines.append(f'    {_display(key)}: {_display(status)}')
     if pending:
         earliest = min(pending, key=lambda value: datetime.fromisoformat(value.replace('Z', '+00:00')))
         lines.append('Next known revisit time: ' + earliest + '; an earliest known condition, not a promise of completion.')

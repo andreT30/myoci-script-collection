@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
+import json
 import unittest
 import oci
 from compartment_cleanup.model import Node, Plan, State, Edge, CleanupError
@@ -12,6 +13,7 @@ from compartment_cleanup.handlers.core import BlockBootVolumes, ComputeInstances
 from compartment_cleanup.handlers.network import Networks
 from compartment_cleanup.handlers.storage import Storage
 from compartment_cleanup.store import Workspace
+from compartment_cleanup.journal import attempt_history, bulk_attempt_records, resource_records
 from compartment_cleanup.gateway import _normalize, GatewayError
 from test_core import CoreGateway, resource, P, C, X, R
 from simulator import StorageSimulator
@@ -86,7 +88,7 @@ class BulkTests(unittest.TestCase):
         self.plan.nodes['a']=replace(self.nodes[0],metadata={'bulk_resource_type':'evil','bulk_metadata':{'inject':'value'}})
         self.nodes[0]=self.plan.nodes['a']
         def assert_journal(params):
-            loaded=self.ws._read('state.json');attempt=loaded['records']['a']['attempts'][0]
+            loaded=self.ws._read('state.json');attempt=loaded['records'][loaded['records']['a']['attempts'][0]['bulk_attempt']]['attempt']
             self.assertEqual(attempt['opc_retry_token'],'token');self.assertEqual(attempt['started_at'],NOW.isoformat())
             self.assertEqual(attempt['resources'],[{'identifier':'a','entity_type':'VolumeBackup','metadata':{}},{'identifier':'b','entity_type':'VolumeBackup','metadata':{}}])
         self.g.before_write=assert_journal
@@ -130,14 +132,14 @@ class BulkTests(unittest.TestCase):
         self.g.header={'opc-work-request-id':'wr2'}
         self.submit(nodes=[self.nodes[1]],token='new')
         self.assertEqual(len(self.state.records['a']['attempts']),1)
-        self.assertEqual([a['request_id'] for a in self.state.records['b']['attempts']],['wr','wr2'])
+        self.assertEqual([a['request_id'] for a in attempt_history(self.state,'b')],['wr','wr2'])
         self.assertEqual([r.identifier for r in self.writes()[-1][4]['bulk_delete_resources_details'].resources],['b'])
 
     def test_partial_failed_preserves_deleted_item_and_requires_live_absence(self):
         self.submit();self.wr('FAILED',[oci.identity.models.WorkRequestResource(identifier='a',entity_type='VolumeBackup',action_type='DELETED'),oci.identity.models.WorkRequestResource(identifier='b',entity_type='VolumeBackup',action_type='FAILED')])
         self.g.resources.pop('a');self.g.rows['list_volume_backups']=[r for r in self.g.rows['list_volume_backups'] if r['id']!='a']
         result=self.inspect();self.assertEqual(result['resources'],{'a':'deleted','b':'failed'});self.assertEqual(result['status'],'failed')
-        self.assertEqual(self.state.records['a']['attempts'][0]['resource_evidence']['a']['action_type'],'DELETED')
+        self.assertEqual(list(attempt_history(self.state,'a'))[0]['resource_evidence']['a']['action_type'],'DELETED')
     def test_success_without_exact_deleted_or_live_active_never_confirms(self):
         self.submit();self.wr();self.assertEqual(self.inspect()['resources']['a'],'unresolved')
         for rows in ([oci.identity.models.WorkRequestResource(identifier='a',entity_type='VolumeBackup',action_type='RELATED')],[],[oci.identity.models.WorkRequestResource(identifier='a',entity_type='volumebackup',action_type='DELETED')]):
@@ -154,7 +156,7 @@ class BulkTests(unittest.TestCase):
         def sleep(seconds):waits.append(seconds);clock[0]+=seconds
         result=self.inspect(wait_seconds=3,clock=lambda:clock[0],sleep=sleep)
         self.assertEqual(result['status'],'pending');self.assertLessEqual(sum(waits),3)
-        self.assertEqual(self.state.records['a']['attempts'][0]['work_request']['status'],'IN_PROGRESS')
+        self.assertEqual(list(attempt_history(self.state,'a'))[0]['work_request']['status'],'IN_PROGRESS')
     def test_denied_complete_inventory_cannot_corroborate_positive_deleted(self):
         self.submit();self.wr();self.g.resources.clear();self.g.rows['list_volume_backups']=GatewayError('blockstorage','list_volume_backups',403)
         self.assertEqual(self.inspect()['resources']['a'],'unresolved')
@@ -165,10 +167,24 @@ class BulkTests(unittest.TestCase):
         with self.ws.locked():result=submit_bulk(g,p,nodes,'storage-token',registry=registry,workspace=self.ws,state=state,now=NOW)
         self.assertEqual(result.status,'pending');self.assertIsNone(result.request_id)
         for n in nodes:
-            attempt=state.records[n.key]['attempts'][0]
+            attempt=list(attempt_history(state,n.key))[0]
             self.assertEqual(attempt['operation'],'batch_delete_objects');self.assertEqual(attempt['payload']['objects'][0],{'object_name':'a','if_match':'etag-a'})
             self.assertIsNotNone(attempt['resource_evidence'][n.key])
         self.assertEqual([e[3] for e in g.events if e[0]=='write'],['batch_delete_objects'])
+
+    def test_inspection_first_or_second_journal_failure_is_fatal_without_recovery_save(self):
+        for failed_call in (1,2):
+            with self.subTest(failed_call=failed_call):
+                self.setUp();self.submit();self.wr()
+                original=self.ws.save_state;calls=[]
+                def flaky(state):
+                    calls.append(1)
+                    if len(calls)==failed_call:raise CleanupError('transient journal failure')
+                    return original(state)
+                self.ws.save_state=flaky
+                with self.assertRaises(CleanupError):self.inspect()
+                self.assertEqual(len(calls),failed_call)
+                self.assertEqual(len(self.writes()),1)
 
     def test_failed_iam_persistence_has_zero_mutations(self):
         def fail_save(state):raise CleanupError('disk failure')
@@ -189,7 +205,7 @@ class BulkTests(unittest.TestCase):
         self.submit();self.wr();self.inspect()
         self.g.work_requests['wr']['resources']=[]
         self.assertEqual(self.inspect()['resources']['a'],'unresolved')
-        self.assertEqual(self.state.records['a']['attempts'][0]['resource_evidence']['a']['action_type'],'DELETED')
+        self.assertEqual(list(attempt_history(self.state,'a'))[0]['resource_evidence']['a']['action_type'],'DELETED')
 
     def test_exact_network_deleted_plus_full_inventory_and_new_consumer(self):
         n=self.registry.classify(resource('nat','NatGateway',state='AVAILABLE'))
@@ -216,6 +232,30 @@ class BulkTests(unittest.TestCase):
         self.g.rows['list_nat_gateways']=[]
         self.assertEqual(self.inspect()['resources']['nat'],'unresolved')
 
+    def test_group_journal_helpers_preserve_direct_history_and_reject_malformed_references(self):
+        from compartment_cleanup.reporting import render_report
+        self.state.records['direct']={'status':'failed','attempts':[{'attempt_id':'direct-token','status':'failed'}]}
+        self.submit()
+        self.assertEqual(list(attempt_history(self.state,'direct')),[{'attempt_id':'direct-token','status':'failed'}])
+        self.assertEqual(set(resource_records(self.state)),{'a','b','direct'})
+        for reference in ({'bulk_attempt':'missing','attempt_id':'token'}, {'bulk_attempt':self.state.records['a']['attempts'][0]['bulk_attempt'],'attempt_id':'wrong'}):
+            original=self.state.records['a']['attempts'];self.state.records['a']['attempts']=[reference]
+            with self.assertRaises(CleanupError):render_report(self.plan,self.state)
+            with self.assertRaises(CleanupError):list(attempt_history(self.state,'a'))
+            self.state.records['a']['attempts']=original
+        key,_=next(bulk_attempt_records(self.state))
+        self.state.records[key]['record_type']='fake'
+        with self.assertRaises(CleanupError):resource_records(self.state)
+
+    def test_report_shows_failed_bulk_outcome_and_configured_limits(self):
+        from compartment_cleanup.reporting import render_report
+        self.submit();self.wr('FAILED');self.inspect()
+        report=render_report(self.plan,self.state)
+        self.assertIn('IAM configured chunks: 20',report)
+        self.assertIn('Storage maximum group: 1000',report)
+        self.assertIn('bulk_delete_resources | status: failed',report)
+        self.assertNotIn('absent from refreshed map',report)
+
     def test_untrusted_mutated_state_cannot_supply_work_request(self):
         self.submit();self.wr();self.state.records['a']['attempts'][0]['compartment_id']=X
         with self.assertRaises(CleanupError):self.inspect()
@@ -231,6 +271,48 @@ class StorageBulkTests(unittest.TestCase):
         self.p=plan_for(all_nodes,parent='parent',child='child');self.registry=Registry({'storage':self.h});self.state=State(1,'tenancy','parent',{})
     def submit(self):
         with self.ws.locked():return submit_bulk(self.g,self.p,self.nodes,'storage-token',registry=self.registry,workspace=self.ws,state=self.state,now=NOW)
+    def sized_group(self,count):
+        self.g.inventory['list_objects']=[obj(str(i)) for i in range(count)]
+        all_nodes,_,_=self.h.discover(self.g,'child',R)
+        self.nodes=[n for n in all_nodes if n.resource_type=='ObjectStorageObject']
+        self.p=plan_for(all_nodes,parent='parent',child='child');self.g.events=[]
+
+    def test_storage_complete_inventory_calls_are_bounded_independent_of_group_size(self):
+        for count in (2,10):
+            with self.subTest(count=count):
+                self.setUp();self.sized_group(count);self.submit()
+                for operation in ('list_objects','list_object_versions'):
+                    calls=[e for e in self.g.events if e[3]==operation]
+                    self.assertLessEqual(len(calls),2)
+                self.assertEqual(len([e for e in self.g.events if e[3]=='head_object']),count)
+
+    def test_bulk_journal_size_grows_linearly_and_group_is_not_a_missing_resource(self):
+        from compartment_cleanup.reporting import render_report
+        sizes=[]
+        for count in (10,40):
+            self.setUp();self.sized_group(count);self.submit()
+            raw=self.ws._read('state.json');sizes.append(len(json.dumps(raw)))
+            payloads=[record for record in raw['records'].values() if 'attempt' in record]
+            self.assertEqual(len(payloads),1)
+            self.assertEqual(len(payloads[0]['attempt']['payload']['objects']),count)
+            references=[record['attempts'] for key,record in raw['records'].items() if key in self.p.nodes]
+            self.assertEqual(sum(len(a) for a in references),count)
+            self.assertNotIn('absent from refreshed map',render_report(self.p,self.state))
+        self.assertLess(sizes[1],sizes[0]*5)
+
+    def test_storage_final_bucket_identity_and_versioning_drift_blocks_before_write(self):
+        for field,value in [('id','recreated'),('versioning','Enabled'),('compartment_id','external')]:
+            self.setUp();original=self.g.read;heads=[]
+            def drifting(service,region,operation,params,endpoint=None):
+                result=original(service,region,operation,params,endpoint)
+                if operation=='head_object':
+                    heads.append(1)
+                    if len(heads)==len(self.nodes):self.g.bucket[field]=value
+                return result
+            self.g.read=drifting
+            with self.assertRaises(CleanupError):self.submit()
+            self.assertEqual([e for e in self.g.events if e[0]=='write'],[])
+
     def test_failed_storage_persistence_has_zero_mutations(self):
         def fail_save(state):raise CleanupError('disk failure')
         self.ws.save_state=fail_save
@@ -242,7 +324,7 @@ class StorageBulkTests(unittest.TestCase):
             raise GatewayError('object_storage','batch_delete_objects')
         self.g.write=lost
         self.assertEqual(self.submit().status,'unresolved')
-        self.assertEqual(self.state.records[self.nodes[0].key]['attempts'][0]['status'],'unresolved')
+        self.assertEqual(list(attempt_history(self.state,self.nodes[0].key))[0]['status'],'unresolved')
         with self.assertRaises(CleanupError):self.submit()
         self.assertEqual(len([e for e in self.g.events if e[0]=='write']),1)
     def test_malformed_storage_response_is_unresolved_and_cannot_replay(self):

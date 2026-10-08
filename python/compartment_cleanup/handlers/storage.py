@@ -360,36 +360,65 @@ class Storage(Handler):
             return Observation('deleted',node.compartment_id,'',None,None,'Exact operation completion and fresh complete inventory absence')
         except Exception:return Observation('unresolved',node.compartment_id,'',None,None,'Completion evidence or live inventory remains unresolved')
 
-    def batch_group(self,gateway,nodes,scope):
-        """Return a typed grouping key only after safe unversioned preflight.
+    def _batch_preflight(self,gateway,nodes,scope):
+        """One complete live snapshot for one bounded group of saved identities."""
+        if not nodes or len(nodes)>1000 or any(n.resource_type!='ObjectStorageObject' or n.blockers for n in nodes):
+            raise CleanupError('Storage batch is ineligible')
+        first=nodes[0]
+        row,_,inventory=self._fresh(gateway,first,scope)
+        if row['versioning']!='Disabled' or any(e['resource_type']=='ObjectStorageVersion' for e in inventory.values()):
+            raise CleanupError('Exact version operations required')
+        if any(e['resource_type'] in ('ObjectStorageLifecyclePolicy','ObjectStorageRetentionRule')
+               or (e['resource_type']=='ObjectStoragePAR' and _par_access(e['identity']) in _PAR_WRITE)
+               for e in inventory.values()):
+            raise CleanupError('Producer or retention preparation pending')
+        saved=self._snapshots[(first.region,row['id'])].metadata['inventory_snapshot']
+        key=(first.region,first.compartment_id,row['namespace'],row['id'])
+        names=set();identities=set()
+        for node in nodes:
+            if (node.region,node.compartment_id,node.metadata.get('namespace'),node.metadata.get('bucket_id'))!=key:
+                raise CleanupError('Storage batch spans bucket identities')
+            if node.metadata.get('bucket_name')!=row['name'] or node.metadata.get('bucket_created')!=row['time_created'] or node.metadata.get('versioning')!='Disabled':
+                raise CleanupError('Storage batch saved bucket identity changed')
+            name=_text(node.metadata.get('object_name'))
+            if name in names or node.key in identities:raise CleanupError('Duplicate storage batch identity')
+            names.add(name);identities.add(node.key)
+            if node.key!=child_key(S+'/ObjectStorageObject',node.region,row['id'],name):
+                raise CleanupError('Saved batch child key does not match typed identity')
+            expected={k:v for k,v in node.metadata.items() if k not in ('bucket_id','bucket_name','namespace','bucket_created','versioning')}
+            entry={'resource_type':'ObjectStorageObject',**expected}
+            if saved.get(node.key)!=entry or inventory.get(node.key)!=entry:
+                raise CleanupError('Saved batch child identity is absent or changed')
+        return key,row,inventory
 
-        Task 8 must additionally group equal graph depths and ready dependencies,
-        journal all intents, and split at 1000 unique names before submit_group.
+    def batch_group(self,gateway,nodes,scope):
+        """Return a group key after one complete shared bucket preflight.
+
+        Submission independently refreshes this snapshot and HEADs each object.
+        Caller supplies dependency-ready nodes of one recomputed graph depth.
         """
-        try:
-            if not nodes or len(nodes)>1000 or any(n.resource_type!='ObjectStorageObject' for n in nodes):return None
-            key=(nodes[0].region,nodes[0].compartment_id,nodes[0].metadata['namespace'],nodes[0].metadata['bucket_id'])
-            names=set()
-            for node in nodes:
-                if (node.region,node.compartment_id,node.metadata['namespace'],node.metadata['bucket_id'])!=key:return None
-                name=node.metadata['object_name']
-                if name in names:return None
-                names.add(name)
-                row,_,inventory=self._fresh(gateway,node,scope)
-                if row['versioning']!='Disabled' or any(e['resource_type']=='ObjectStorageVersion' for e in inventory.values()):return None
-                if self.inspect(gateway,node,scope).status!='present':return None
-            return key
+        try:return self._batch_preflight(gateway,nodes,scope)[0]
         except Exception:return None
 
     def submit_group(self,gateway,nodes,scope,attempt_id,*,before_write=None):
-        if self.batch_group(gateway,nodes,scope) is None:raise CleanupError('Storage batch is ineligible')
+        _,row,inventory=self._batch_preflight(gateway,nodes,scope)
         identifiers=[];observations={}
         for node in nodes:
-            observed=self.inspect(gateway,node,scope)
-            if observed.status!='present' or not observed.etag:raise CleanupError('Batch preflight changed')
-            observations[node.key]=observed
-            identifiers.append(oci.object_storage.models.BatchDeleteObjectIdentifier(object_name=node.metadata['object_name'],if_match=observed.etag))
+            _,headers=gateway.read(S,node.region,'head_object',{
+                'namespace_name':row['namespace'],'bucket_name':row['name'],'object_name':node.metadata['object_name']})
+            etag=_text(headers.get('etag'))
+            if headers.get('__http_status__')!=200 or etag!=inventory[node.key]['identity']['etag']:
+                raise CleanupError('Batch HEAD identity is unresolved')
+            observations[node.key]=Observation('present',node.compartment_id,'',None,etag,'Fresh exact object HEAD')
+            identifiers.append(oci.object_storage.models.BatchDeleteObjectIdentifier(object_name=node.metadata['object_name'],if_match=etag))
         first=nodes[0]
+        # A bucket can move, be recreated, or enable versioning during HEADs.
+        # Recheck immediately before persisting the exact conditional body.
+        namespace=self._namespace(gateway,first.region)
+        if namespace!=row['namespace']:raise CleanupError('Canonical namespace changed during batch preflight')
+        final,_=self._bucket(gateway,first.region,namespace,row['name'])
+        if any(final[field]!=row[field] for field in ('id','compartment_id','time_created','namespace','name','versioning')) or final['versioning']!='Disabled':
+            raise CleanupError('Bucket identity or versioning changed during batch preflight')
         params={
             'namespace_name':first.metadata['namespace'],'bucket_name':first.metadata['bucket_name'],
             'batch_delete_objects_details':oci.object_storage.models.BatchDeleteObjectsDetails(objects=identifiers,is_skip_deleted_result=False),
