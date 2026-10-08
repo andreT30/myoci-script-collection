@@ -58,6 +58,14 @@ def compute_depths(nodes: dict[str, Node], edges: list[Edge]) -> tuple[dict[str,
     for key, node in nodes.items():
         if key != node.key:
             raise CleanupError("Duplicate or mismatched node identity")
+        if node.action == "cascade":
+            owner_key = node.metadata.get("cascade_owner")
+            owner = nodes.get(owner_key) if isinstance(owner_key, str) else None
+            members = owner.metadata.get("cascade_members", []) if owner else []
+            if (owner is None or node.metadata.get("cascade_verified") is not True
+                    or not isinstance(members, list) or key not in members
+                    or owner.action in {"retain", "unresolved"}):
+                reasons[key] = {"Unverified cascade membership"}
         if node.blockers or node.action == "unresolved":
             reasons[key] = set(node.blockers or ("Unresolved deletion method",))
     for edge in edges:
@@ -93,7 +101,7 @@ def compute_depths(nodes: dict[str, Node], edges: list[Edge]) -> tuple[dict[str,
                 pending.append(after)
     depths = {}
     for key in reversed(order):
-        if key in reasons or nodes[key].action == "retain":
+        if key in reasons or nodes[key].action in {"retain", "cascade"}:
             continue
         downstream = [depths[after] for after in successors[key] if after in depths]
         depths[key] = 1 + max(downstream, default=0)

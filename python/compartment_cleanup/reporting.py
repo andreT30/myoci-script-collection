@@ -50,6 +50,13 @@ def render_report(plan: Plan, state: State) -> str:
             for reason in blockers[key]:
                 lines.append('    blocker: ' + _display(reason))
         lines.append('')
+    cascade_members = [key for key, node in plan.nodes.items() if node.action == 'cascade' and key not in blockers]
+    if cascade_members:
+        lines.append('Cascade members; verify removal through their owner')
+        for key in sorted(cascade_members):
+            resource(key)
+            lines.append('    cascade owner: ' + _display(plan.nodes[key].metadata.get('cascade_owner', 'unverified')))
+        lines.append('')
     lines.append('Coverage probes and gaps')
     if not plan.probes:
         lines.append('  No discovery probes recorded; coverage is unverified.')
