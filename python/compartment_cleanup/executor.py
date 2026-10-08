@@ -311,3 +311,351 @@ def inspect_bulk(gateway, plan, request_id, *, registry=None, workspace=None, st
         remaining=deadline-clock()
         if result['status']!='pending' or remaining<=0:return result
         sleep(min(5,remaining))
+
+# Direct submissions use the handler’s typed dispatch, never journal dispatch.
+from dataclasses import replace
+from uuid import uuid4
+from .discovery import discover
+from .gateway import discover_scope, GatewayError
+from .journal import attempt_history
+from .model import Observation, plan_to_dict, state_to_dict
+from .reporting import render_report
+
+class JournalError(CleanupError):
+    """A local persistence failure stops every subsequent mutation."""
+
+def _save(workspace, state):
+    try:
+        workspace.save_state(state)
+    except Exception as error:
+        raise JournalError('Cannot persist cleanup journal; stop all mutations') from error
+
+def _scope_now(gateway, plan):
+    tenancy, home, _, current = discover_scope(gateway, plan.parent_id)
+    gateway.cleanup_scope = set(plan.compartments)
+    if tenancy != plan.tenancy_id or home != plan.home_region:
+        raise CleanupError('Authenticated tenancy or home region changed')
+    if current.get(plan.parent_id) != plan.compartments[plan.parent_id]:
+        raise CleanupError('Retained parent membership changed')
+    moved = {k for k, v in gateway.compartment_links.items() if k in plan.compartments and v != plan.compartments[k]}
+    return (current, moved)
+
+def _bind(registry, plan):
+    for handler in registry.handlers.values():
+        if type(handler) is Storage:
+            handler.bind_plan([registry.classify(n) for n in plan.nodes.values() if n.resource_type != 'Compartment'])
+
+def _progress_node(plan, node, state, registry):
+    safe = registry.classify(node) if node.resource_type != 'Compartment' else node
+    metadata = deepcopy(safe.metadata)
+    for key, prep in plan.nodes.items():
+        if prep.resource_type != 'RouteTablePreparation' or state.records.get(key, {}).get('status') != 'deleted':
+            continue
+        target = prep.metadata.get('route_table_id')
+        if safe.key == target and metadata.get('route_rules') == prep.metadata.get('route_rules'):
+            metadata['route_rules'] = []
+        member = metadata.get('cascade_snapshot', {}).get(target)
+        if isinstance(member, dict) and member.get('references', {}).get('route_rules') == prep.metadata.get('route_rules'):
+            member['references']['route_rules'] = []
+    return replace(safe, metadata=metadata)
+
+def _observe(gateway, node, scope, handler, state, plan=None):
+    record = state.records.setdefault(node.key, {'status': 'discovered', 'attempts': []})
+    if node.resource_type == 'Compartment':
+        try:
+            row, headers = gateway.read('identity', node.region, 'get_compartment', {'compartment_id': node.key})
+            if row.get('id') != node.key or row.get('compartment_id') != node.compartment_id:
+                return Observation('moved', row.get('compartment_id', ''), ' ', None, None, 'Compartment membership changed')
+            status = 'deleted' if row.get('lifecycle_state') == 'DELETED' else 'present' if row.get('lifecycle_state') == 'ACTIVE' else 'pending'
+            return Observation(status, node.compartment_id, row.get('lifecycle_state', ''), None, headers.get('etag'), 'Fresh IAM observation')
+        except Exception:
+            return Observation('unresolved', node.compartment_id, '', None, None, 'IAM terminal proof unresolved')
+    if handler is None:
+        return Observation('unresolved', node.compartment_id, '', None, None, 'Unsupported resource')
+    observation = handler.inspect(gateway, node, scope)
+    history = list(attempt_history(state, node.key))
+    if type(handler) is Storage and history:
+        evidence = history[-1].get('operation_evidence') or history[-1].get('resource_evidence', {}).get(node.key)
+        if evidence:
+            observation = handler.reconcile_submission(gateway, node, evidence, scope)
+    elif observation.status == 'unresolved' and history and hasattr(handler, 'inspect_work_request'):
+        request = history[-1].get('request_id')
+        if request:
+            observation = handler.inspect_work_request(gateway, node, request, scope)
+    if observation.status == 'unresolved' and plan is not None and (node.resource_type == 'RouteTablePreparation'):
+        target = plan.nodes.get(node.metadata.get('route_table_id'))
+        proof = record.get('terminal_observation')
+        if target is not None and isinstance(proof, dict) and (proof.get('node_key') == node.key):
+            target_observation = _observe(gateway, Networks().classify(target), scope, Networks(), state, plan)
+            if target_observation.status == 'deleted':
+                observation = Observation('deleted', node.compartment_id, '', None, None, 'Completed route preparation and positively verified removed route table')
+    if observation.status == 'unresolved' and plan is not None:
+        owner_key = node.metadata.get('bucket_id') if type(handler) is Storage and node.resource_type != 'Bucket' else node.metadata.get('cascade_owner')
+        owner = plan.nodes.get(owner_key) if isinstance(owner_key, str) else None
+        if owner is not None and owner.key != node.key and (not owner.metadata.get('cascade_owner')):
+            owner_handler = handler
+            owner_observation = _observe(gateway, owner, scope, owner_handler, state)
+            if owner_observation.status == 'deleted':
+                memberships = [a.get('cascade_membership', {}) for a in attempt_history(state, owner.key)]
+                member_proof = any((node.key in m.get('cascade_members', []) and node.key in m.get('cascade_snapshot', {}) for m in memberships))
+                storage_proof = False
+                if type(handler) is Storage:
+                    for a in history:
+                        evidence = a.get('operation_evidence') or a.get('resource_evidence', {}).get(node.key)
+                        if isinstance(evidence, dict) and evidence.get('node_key') == node.key and (evidence.get('bucket_id') == owner.key) and (evidence.get('bucket_created') == node.metadata.get('bucket_created')) and (evidence.get('region') == node.region):
+                            storage_proof = evidence.get('http_status') == 204 or (evidence.get('operation') == 'batch_delete_objects' and bool(evidence.get('deleted_at')))
+                if member_proof or storage_proof:
+                    try:
+                        found, _, probes = handler.discover(gateway, node.compartment_id, node.region)
+                    except Exception:
+                        found, probes = [], []
+                    if probes and all((p.status == 'complete' for p in probes)) and (not any((n.key == node.key for n in found))):
+                        observation = Observation('deleted', node.compartment_id, '', None, None, 'Durable exact member proof and positive owner deletion with complete fresh inventory')
+    proof = record.get('terminal_observation')
+    if observation.status == 'unresolved' and isinstance(proof, dict) and (proof.get('node_key') == node.key) and (proof.get('resource_type') == node.resource_type) and (proof.get('compartment_id') == node.compartment_id) and hasattr(handler, 'corroborate_bulk_absence'):
+        if handler.corroborate_bulk_absence(gateway, node, scope):
+            observation = Observation('deleted', node.compartment_id, proof['lifecycle_state'], None, None, 'Persisted positive terminal observation and fresh complete typed inventory absence')
+    if observation.status == 'deleted':
+        for attempt in record.get('attempts', []):
+            if 'bulk_attempt' not in attempt:
+                attempt['status'] = 'deleted'
+    return observation
+
+def _apply_observation(state, node, observation):
+    record = state.records.setdefault(node.key, {'status': 'discovered', 'attempts': []})
+    record.update(status=observation.status, lifecycle_state=observation.lifecycle_state, detail=observation.detail)
+    if observation.status == 'deleted':
+        record['terminal_observation'] = {'node_key': node.key, 'resource_type': node.resource_type, 'compartment_id': node.compartment_id, 'lifecycle_state': observation.lifecycle_state, 'observed_at': datetime.now(timezone.utc).isoformat()}
+    if observation.status in ('present', 'pending', 'deleted') and node.action == 'schedule':
+        old = record.get('scheduled_at')
+        if old is not None and old != observation.scheduled_at:
+            record.setdefault('schedule_history', []).append({'scheduled_at': old})
+        record['scheduled_at'] = observation.scheduled_at
+    elif observation.scheduled_at is not None:
+        record['scheduled_at'] = observation.scheduled_at
+
+def _previous(plan, state):
+    """Drop only positively reconciled removals from historical refresh inventory."""
+    done = {k for k, r in resource_records(state).items() if r.get('status') == 'deleted' and k != plan.parent_id}
+    return replace(plan, nodes={k: v for k, v in plan.nodes.items() if k not in done}, compartments={k: v for k, v in plan.compartments.items() if k not in done}, edges=[e for e in plan.edges if e.before not in done and e.after not in done], probes=[p for p in plan.probes if p.compartment_id not in done], depths={k: v for k, v in plan.depths.items() if k not in done})
+
+def _inventory(gateway, plan, state, registry):
+    live = discover(gateway, plan.parent_id, registry, previous=_previous(plan, state))
+    gateway.cleanup_scope = set(plan.compartments)
+    added = set(live.nodes) - set(plan.nodes)
+    moved = {k for k in set(live.nodes) & set(plan.nodes) if (live.nodes[k].resource_type, live.nodes[k].region, live.nodes[k].compartment_id) != (plan.nodes[k].resource_type, plan.nodes[k].region, plan.nodes[k].compartment_id)}
+    moved.update((k for k, v in gateway.compartment_links.items() if k in plan.compartments and v != plan.compartments[k]))
+    moved.update((k for k, n in live.nodes.items() if k in plan.nodes and n.metadata.get('observed_compartment_id', n.compartment_id) != plan.nodes[k].compartment_id))
+    for key, node in live.nodes.items():
+        if key in plan.nodes and state.records.get(key, {}).get('status') == 'deleted' and (_observe(gateway, registry.classify(node) if node.resource_type != 'Compartment' else node, set(plan.compartments), registry.handler_for(node), state).status != 'deleted'):
+            state.records[key]['status'] = 'unresolved'
+            state.records[key]['detail'] = 'Live resource reappeared after terminal proof; refresh report'
+            moved.add(key)
+    return (live, added, moved)
+
+class _SubmissionGateway:
+    """Capture exactly one already code-defined handler write at its boundary."""
+
+    def __init__(self, gateway, plan, state, workspace, node, handler, attempt, registry):
+        self.gateway = gateway
+        self.plan = plan
+        self.state = state
+        self.workspace = workspace
+        self.node = node
+        self.handler = handler
+        self.attempt = attempt
+        self.registry = registry
+        self.used = False
+
+    def __getattr__(self, name):
+        return getattr(self.gateway, name)
+
+    def write(self, service, region, operation, params, endpoint=None):
+        if self.used:
+            raise CleanupError('A direct attempt permits one typed operation')
+        self.used = True
+        current, moved = _scope_now(self.gateway, self.plan)
+        if moved or set(current) - set(self.plan.compartments):
+            raise CleanupError('Compartment boundary drift before submission')
+        fresh = _observe(self.gateway, self.node, set(self.plan.compartments), self.handler, self.state)
+        if fresh.status != 'present' or (params.get('if_match') is not None and params['if_match'] != fresh.etag):
+            raise CleanupError('Fresh direct submission identity or ETag changed')
+        if self.node.compartment_id not in current and self.node.resource_type != 'Compartment':
+            raise CleanupError('Resource compartment disappeared from live scope')
+        self.attempt.update(service=service, region=region, operation=operation, endpoint=endpoint, params=oci.util.to_dict(params), preflight={'compartment_id': fresh.compartment_id, 'etag': fresh.etag, 'lifecycle_state': fresh.lifecycle_state}, cascade_membership=deepcopy({k: self.node.metadata[k] for k in ('cascade_members', 'cascade_snapshot') if k in self.node.metadata}))
+        self.state.records[self.node.key]['attempts'].append(self.attempt)
+        self.state.records[self.node.key]['status'] = 'attempting'
+        _save(self.workspace, self.state)
+        return self.gateway.write(service, region, operation, params, endpoint=endpoint)
+
+def _direct(gateway, plan, state, workspace, node, handler, registry, observation):
+    attempt = {'attempt_id': str(uuid4()), 'status': 'attempting', 'started_at': datetime.now(timezone.utc).isoformat(), 'node_key': node.key, 'resource_type': node.resource_type, 'compartment_id': node.compartment_id}
+    proxy = _SubmissionGateway(gateway, plan, state, workspace, node, handler, attempt, registry)
+    try:
+        if node.resource_type == 'Compartment':
+            proxy.write('identity', plan.home_region, 'delete_compartment', {'compartment_id': node.key})
+            submission = Submission('pending', None, None, 'Compartment delete accepted; terminal IAM proof required')
+        else:
+            submission = handler.submit(proxy, node, observation, attempt['attempt_id'])
+    except JournalError:
+        raise
+    except Exception as error:
+        if not proxy.used or 'params' not in attempt:
+            state.records[node.key].update(status='unresolved', detail='Typed action preflight changed; refresh report', run_blocked=True)
+            _save(workspace, state)
+            return
+        attempt.update(status='unresolved', detail=str(error))
+        state.records[node.key].update(status='unresolved', detail='Response uncertain; reconcile before any replay')
+        _save(workspace, state)
+        if isinstance(error, GatewayError) and error.status in (401, 403):
+            raise CleanupError('OCI authentication or authorization failed during submission') from error
+        return
+    attempt.update(status=submission.status, request_id=submission.request_id, scheduled_at=submission.scheduled_at, detail=submission.detail, operation_evidence=submission.operation_evidence)
+    state.records[node.key].update(status=submission.status, scheduled_at=submission.scheduled_at, detail=submission.detail)
+    _save(workspace, state)
+
+def execute(plan, state, workspace, gateway, registry, supplied_parent, wait_seconds=300):
+    """Execute only saved identities; each run has a positive bounded wait budget.
+
+    Local/schema/authentication/scope failures raise CleanupError (CLI exit 1).
+    Known drift and unfinished service operations remain durable exit-2 progress.
+    """
+    plan_to_dict(plan)
+    state_to_dict(state)
+    scope = validate_scope(plan, supplied_parent)
+    if state.tenancy_id != plan.tenancy_id or state.parent_id != plan.parent_id:
+        raise CleanupError('Journal boundary differs from plan')
+    if type(wait_seconds) not in (int, float) or not math.isfinite(wait_seconds) or wait_seconds <= 0:
+        raise CleanupError('Wait budget must be positive and finite')
+    deadline = time.monotonic() + wait_seconds
+    resource_records(state)
+    with workspace.locked():
+        _scope_now(gateway, plan)
+        _bind(registry, plan)
+        for record in resource_records(state).values():
+            record.pop('run_blocked', None)
+        for _, attempt in list(bulk_attempt_records(state)):
+            if attempt.get('service') == 'identity' and attempt.get('request_id'):
+                outcome = inspect_bulk(gateway, plan, attempt['request_id'], registry=registry, workspace=workspace, state=state, wait_seconds=0)
+                for key, status in outcome['resources'].items():
+                    state.records[key]['status'] = status
+                _save(workspace, state)
+        for key, old in plan.nodes.items():
+            if key == plan.parent_id:
+                continue
+            safe = _progress_node(plan, old, state, registry)
+            observation = _observe(gateway, safe, scope, registry.handler_for(safe), state, plan)
+            if state.records.get(key, {}).get('status') == 'deleted' and observation.status == 'unresolved' and any((a.get('resource_status', {}).get(key) == 'deleted' for a in attempt_history(state, key))):
+                continue
+            _apply_observation(state, safe, observation)
+        _save(workspace, state)
+        live, added, moved = _inventory(gateway, plan, state, registry)
+        hierarchy_drift = moved & scope or set(live.compartments) - scope or any((live.compartments.get(k) != v for k, v in plan.compartments.items() if state.records.get(k, {}).get('status') != 'deleted'))
+        while not hierarchy_drift and time.monotonic() < deadline:
+            _bind(registry, plan)
+            for key, old in plan.nodes.items():
+                if key == plan.parent_id:
+                    continue
+                safe = _progress_node(plan, old, state, registry)
+                observation = _observe(gateway, safe, scope, registry.handler_for(safe), state, plan)
+                if state.records.get(key, {}).get('status') == 'deleted' and observation.status == 'unresolved':
+                    continue
+                if state.records.get(key, {}).get('status') == 'failed':
+                    continue
+                _apply_observation(state, safe, observation)
+            _save(workspace, state)
+            depths, blocked = compute_depths(live.nodes, live.edges)
+            predecessors = {k: set() for k in live.nodes}
+            for edge in live.edges:
+                predecessors[edge.after].add(edge.before)
+            ready = []
+            for key in sorted(depths, key=lambda k: (-depths[k], k)):
+                if key not in plan.nodes or key in moved or key in blocked:
+                    continue
+                node = live.nodes[key]
+                record = state.records.get(key, {})
+                if record.get('status') != 'present' or record.get('run_blocked'):
+                    continue
+                if any((state.records.get(p, {}).get('status') not in ('deleted', 'prepared') for p in predecessors[key])):
+                    continue
+                history = list(attempt_history(state, key))
+                if history and (history[-1].get('status') != 'failed' or history[-1].get('resource_status', {}).get(key, 'failed') != 'failed'):
+                    continue
+                if node.action in ('unresolved', 'retain', 'cascade') or node.blockers:
+                    continue
+                ready.append(node)
+            if not ready:
+                pending = [key for key, record in resource_records(state).items() if key in plan.nodes and record.get('status') == 'pending' and (plan.nodes[key].resource_type == 'Compartment' or registry.classify(plan.nodes[key]).action != 'schedule')]
+                if not pending:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(5, remaining))
+                for _, attempt in list(bulk_attempt_records(state)):
+                    if attempt.get('service') == 'identity' and attempt.get('request_id') and (attempt.get('status') == 'pending'):
+                        outcome = inspect_bulk(gateway, plan, attempt['request_id'], registry=registry, workspace=workspace, state=state, wait_seconds=0)
+                        for key, status in outcome['resources'].items():
+                            state.records[key]['status'] = status
+                live, added, moved = _inventory(gateway, plan, state, registry)
+                continue
+            groups = bulk_groups(live, ready, registry)
+            selected = groups[0] if groups else None
+            if selected:
+                candidate = replace(live, compartments=dict(plan.compartments))
+                _, boundary_moved = _scope_now(gateway, plan)
+                if boundary_moved:
+                    break
+                gateway.cleanup_scope = scope
+                submission = submit_bulk(gateway, candidate, selected, str(uuid4()), registry=registry, workspace=workspace, state=state)
+                if submission.request_id:
+                    outcome = inspect_bulk(gateway, candidate, submission.request_id, registry=registry, workspace=workspace, state=state, wait_seconds=0)
+                    for key, status in outcome['resources'].items():
+                        state.records[key]['status'] = status
+                for node in selected:
+                    if type(registry.handler_for(node)) is Storage:
+                        _apply_observation(state, node, _observe(gateway, node, scope, registry.handler_for(node), state, plan))
+                _save(workspace, state)
+            else:
+                node = ready[0]
+                handler = registry.handler_for(node)
+                if node.resource_type == 'Compartment':
+                    checked, extra, drift = _inventory(gateway, plan, state, registry)
+                    if extra or drift or any((p.status != 'complete' for p in checked.probes if p.compartment_id == node.key)):
+                        state.records[node.key]['run_blocked'] = True
+                        _save(workspace, state)
+                        live, added, moved = checked, extra, drift
+                        continue
+                    if any((k != node.key and (n.compartment_id == node.key or checked.compartments.get(k) == node.key) and (state.records.get(k, {}).get('status') != 'deleted') for k, n in checked.nodes.items())):
+                        state.records[node.key]['run_blocked'] = True
+                        _save(workspace, state)
+                        continue
+                safe = _progress_node(plan, plan.nodes[node.key], state, registry)
+                observation = _observe(gateway, safe, scope, handler, state, plan)
+                if observation.status != 'present':
+                    _apply_observation(state, safe, observation)
+                    _save(workspace, state)
+                else:
+                    _direct(gateway, plan, state, workspace, safe, handler, registry, observation)
+                    _apply_observation(state, safe, _observe(gateway, safe, scope, handler, state, plan))
+                    _save(workspace, state)
+            live, added, moved = _inventory(gateway, plan, state, registry)
+            hierarchy_drift = moved & scope or set(live.compartments) - scope or any((live.compartments.get(k) != v for k, v in plan.compartments.items() if state.records.get(k, {}).get('status') != 'deleted'))
+        live, added, moved = _inventory(gateway, plan, state, registry)
+        incomplete = bool(added or moved or hierarchy_drift or (not live.probes) or any((p.status != 'complete' for p in live.probes)) or any((k != plan.parent_id and state.records.get(k, {}).get('status') not in ('deleted', 'prepared') for k in plan.nodes)) or any((k != plan.parent_id and state.records.get(k, {}).get('status') not in ('deleted', 'prepared') for k in live.nodes)))
+        state.records.setdefault(plan.parent_id, {'status': 'retained', 'attempts': []})['verification'] = {'complete': not incomplete, 'added': sorted(added), 'moved': sorted(moved), 'coverage': [{'service': p.service, 'region': p.region, 'compartment_id': p.compartment_id, 'status': p.status} for p in live.probes]}
+        _save(workspace, state)
+        try:
+            workspace.save_report(render_report(live, state) + cleanup_result(plan, state)[0] + '\n')
+        except Exception as error:
+            raise JournalError('Cannot persist final cleanup report') from error
+    return state
+
+def cleanup_result(plan, state):
+    """Return the exact coverage-qualified outcome; internal groups are not nodes."""
+    records = resource_records(state)
+    verification = records.get(plan.parent_id, {}).get('verification', {})
+    complete = verification.get('complete') is True and all((records.get(k, {}).get('status') in ('deleted', 'prepared') for k in plan.nodes if k != plan.parent_id))
+    if complete:
+        return (f'Cleanup complete for the recorded discovery coverage; retained parent: {plan.parent_id}.', 0)
+    return (f'Cleanup incomplete for the recorded discovery coverage; retained parent: {plan.parent_id}. OCI has no universal resource inventory; preserve the work directory and rerun after resolving reported blockers.', 2)
