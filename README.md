@@ -15,9 +15,6 @@ and an identity with permission to read or modify the resources involved.
 - `jq` is required by the Bash tools.
 - The OCI CLI configuration defaults to `~/.oci/config` and the `DEFAULT`
   profile unless the tool or environment specifies otherwise.
-- CSV, TSV, generated bulk-tag JSON, Python caches, local environments, and
-  pre-existing tests are intentionally excluded from Git by `.gitignore`. The
-  compartment-cleanup test suite is tracked.
 
 Make the scripts executable after cloning if the filesystem did not preserve
 their modes:
