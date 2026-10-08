@@ -12,10 +12,14 @@ venv/
 .env.*
 
 # Locally excluded tests
-/tests/
+/tests/*
+!/tests/compartment_cleanup/
 
 # Generated OCI reports and payloads
 *.csv
 *.tsv
 resources.json
 bulkedit.json
+
+# Local resumable cleanup artifacts
+.oci-cleanup/
