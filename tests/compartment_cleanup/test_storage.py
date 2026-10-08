@@ -131,7 +131,7 @@ class StorageTests(unittest.TestCase):
 
     def test_lifecycle_preparation_and_par_are_explicit_before_bucket(self):
         self.g.bucket['object_lifecycle_policy_etag']='policy-etag';self.g.inventory['list_objects']=[obj()]
-        self.g.inventory['list_preauthenticated_requests']=[{'id':'par','name':'p','time_created':'2026-10-01T00:00:00+00:00','access_uri':'SECRET'}]
+        self.g.inventory['list_preauthenticated_requests']=[{'id':'par','name':'p','access_type':'ObjectRead','time_created':'2026-10-01T00:00:00+00:00','access_uri':'SECRET'}]
         nodes,edges,_=self.discover();policy=next(n for n in nodes if n.resource_type=='ObjectStorageLifecyclePolicy');par=next(n for n in nodes if n.resource_type=='ObjectStoragePAR')
         object_node=next(n for n in nodes if n.resource_type=='ObjectStorageObject')
         self.assertIn((policy.key,object_node.key),[(e.before,e.after) for e in edges])
@@ -320,3 +320,72 @@ class StorageTests(unittest.TestCase):
         evidence={'node_key':'forged-key','bucket_id':node.metadata['bucket_id'],'bucket_created':node.metadata['bucket_created'],
             'region':R,'operation':'delete_object','http_status':204,'etag':'etag-a','submitted_at':self.g.now.isoformat()}
         self.assertEqual(self.h.reconcile_submission(self.g,forged,evidence,{'child'}).status,'unresolved')
+
+    def par(self,access_type):
+        return {'id':'par','name':'p','object_name':'a','access_type':access_type,
+                'time_created':'2026-10-01T00:00:00+00:00','time_expires':'2026-10-09T00:00:00+00:00'}
+
+    def test_write_capable_par_is_preparation_before_objects_and_versions(self):
+        for access in ['ObjectWrite','ObjectReadWrite','AnyObjectWrite','AnyObjectReadWrite']:
+            for versioned in [False,True]:
+                with self.subTest(access=access,versioned=versioned):
+                    self.setUp();self.g.inventory['list_preauthenticated_requests']=[self.par(access)]
+                    self.g.inventory['list_object_versions' if versioned else 'list_objects']=[obj(version='v') if versioned else obj()]
+                    if versioned:self.g.bucket['versioning']='Enabled'
+                    nodes,edges,_=self.discover()
+                    par=next(n for n in nodes if n.resource_type=='ObjectStoragePAR')
+                    target=next(n for n in nodes if n.resource_type in ('ObjectStorageObject','ObjectStorageVersion'))
+                    self.assertEqual(par.action,'prepare')
+                    self.assertEqual(self.h.classify(replace(par,action='delete')).action,'prepare')
+                    self.assertIn((par.key,target.key),[(e.before,e.after) for e in edges])
+                    observation=self.h.inspect(self.g,target,{'child'})
+                    self.assertEqual(observation.status,'unresolved')
+                    with self.assertRaises(CleanupError):self.h.submit(self.g,target,observation,'attempt')
+                    result=self.h.submit(self.g,par,self.h.inspect(self.g,par,{'child'}),'attempt')
+                    self.assertEqual(self.h.reconcile_submission(self.g,par,result.operation_evidence,{'child'}).status,'deleted')
+                    self.assertEqual(self.h.inspect(self.g,target,{'child'}).status,'present')
+
+    def test_batch_waits_for_write_par_preparation_and_rechecks_live_producers(self):
+        self.g.inventory['list_objects']=[obj()]
+        self.g.inventory['list_preauthenticated_requests']=[self.par('AnyObjectWrite')]
+        nodes,_,_=self.discover();target=next(n for n in nodes if n.resource_type=='ObjectStorageObject')
+        par=next(n for n in nodes if n.resource_type=='ObjectStoragePAR')
+        self.assertIsNone(self.h.batch_group(self.g,[target],{'child'}))
+        with self.assertRaises(CleanupError):self.h.submit_group(self.g,[target],{'child'},'attempt')
+        self.assertFalse(self.writes())
+        self.h.submit(self.g,par,self.h.inspect(self.g,par,{'child'}),'attempt')
+        self.assertIsNotNone(self.h.batch_group(self.g,[target],{'child'}))
+        self.g.inventory['list_preauthenticated_requests']=[self.par('AnyObjectWrite')]
+        with self.assertRaises(CleanupError):self.h.submit_group(self.g,[target],{'child'},'attempt')
+        self.assertEqual(len(self.writes()),1)
+
+    def test_unknown_par_permission_is_unresolved_for_individual_and_batch(self):
+        for access in [None,'UNKNOWN_ENUM_VALUE','BucketWrite','objectwrite',[],{}]:
+            with self.subTest(access=access):
+                self.setUp();self.g.inventory['list_preauthenticated_requests']=[self.par(access)]
+                self.g.inventory['list_objects']=[obj()]
+                nodes,_,_=self.discover()
+                self.assertTrue(any(n.resource_type=='ObjectStoragePAR' for n in nodes))
+                target=next(n for n in nodes if n.resource_type=='ObjectStorageObject')
+                par=next(n for n in nodes if n.resource_type=='ObjectStoragePAR')
+                self.assertTrue(par.blockers);self.assertEqual(par.action,'unresolved')
+                self.assertEqual(self.h.classify(par).action,'unresolved')
+                self.assertEqual(self.h.inspect(self.g,target,{'child'}).status,'unresolved')
+                self.assertIsNone(self.h.batch_group(self.g,[target],{'child'}));self.assertFalse(self.writes())
+
+    def test_read_only_par_waits_only_before_bucket_and_allows_objects_and_batch(self):
+        for access in ['ObjectRead','AnyObjectRead']:
+            with self.subTest(access=access):
+                self.setUp();self.g.inventory['list_preauthenticated_requests']=[self.par(access)]
+                self.g.inventory['list_objects']=[obj()]
+                nodes,edges,_=self.discover();target=next(n for n in nodes if n.resource_type=='ObjectStorageObject')
+                par=next(n for n in nodes if n.resource_type=='ObjectStoragePAR');bucket=next(n for n in nodes if n.resource_type=='Bucket')
+                self.assertEqual(par.action,'delete');self.assertNotIn((par.key,target.key),[(e.before,e.after) for e in edges])
+                self.assertIn((par.key,bucket.key),[(e.before,e.after) for e in edges])
+                self.assertEqual(self.h.inspect(self.g,target,{'child'}).status,'present')
+                self.assertIsNotNone(self.h.batch_group(self.g,[target],{'child'}))
+
+    def test_actual_sdk_par_access_enums_cover_the_producer_allowlist(self):
+        cls=oci.object_storage.models.PreauthenticatedRequestSummary
+        self.assertEqual({getattr(cls,name) for name in dir(cls) if name.startswith('ACCESS_TYPE_')},
+                         {'ObjectRead','ObjectWrite','ObjectReadWrite','AnyObjectRead','AnyObjectWrite','AnyObjectReadWrite'})

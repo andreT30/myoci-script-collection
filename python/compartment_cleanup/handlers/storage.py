@@ -15,12 +15,20 @@ from .base import Handler
 from ..model import CleanupError, Edge, Node, Observation, Probe, Submission, child_key
 
 S='object_storage'
+# SDK PreauthenticatedRequestSummary access_type values, verified at the SDK floor.
+_PAR_WRITE=frozenset({'ObjectWrite','ObjectReadWrite','AnyObjectWrite','AnyObjectReadWrite'})
+_PAR_READ=frozenset({'ObjectRead','AnyObjectRead'})
 _TYPES=('Bucket','ObjectStorageObject','ObjectStorageVersion','ObjectStorageMultipartUpload',
         'ObjectStoragePAR','ObjectStorageLifecyclePolicy','ObjectStorageRetentionRule','ObjectStorageReplication')
 _META=('bucket_id','bucket_name','namespace','bucket_created','inventory_snapshot','versioning',
        'identity','object_name','version_id','upload_id','par_id','retention_rule_id','policy_etag')
 _LISTS=('list_objects','list_object_versions','list_multipart_uploads',
         'list_preauthenticated_requests','list_retention_rules','list_replication_policies','list_replication_sources')
+
+
+def _par_access(identity):
+    access=identity.get('access_type') if isinstance(identity,dict) else None
+    return access if isinstance(access,str) else None
 
 
 def _text(value):
@@ -52,6 +60,11 @@ class Storage(Handler):
 
     def classify(self,node):
         action='prepare' if node.resource_type in ('ObjectStorageLifecyclePolicy','ObjectStorageRetentionRule') else 'delete'
+        if node.resource_type=='ObjectStoragePAR':
+            access=_par_access(node.metadata.get('identity'))
+            if access in _PAR_WRITE:action='prepare'
+            elif access not in _PAR_READ:
+                node=_blocked(node,'Unknown PAR access permission; producer safety unresolved')
         if node.resource_type=='ObjectStorageReplication' or node.blockers:action='unresolved'
         return replace(node,handler=self.name,action=action,
                        metadata={k:v for k,v in node.metadata.items() if k in self.metadata_keys})
@@ -105,6 +118,8 @@ class Storage(Handler):
             key=_text(item.get('id'));_time(item.get('time_created'))
             identity={k:item.get(k) for k in ('id','time_created','name','object_name','access_type','time_expires')}
             add('ObjectStoragePAR',key,identity,{'par_id':key})
+            if _par_access(identity) not in _PAR_WRITE|_PAR_READ:
+                issues.append('Unknown PAR access permission; producer safety unresolved')
         for item in values['list_retention_rules']:
             key=_text(item.get('id'));_time(item.get('time_created'));_text(item.get('etag'))
             identity={k:item.get(k) for k in ('id','etag','time_created','time_modified','time_rule_locked','duration')}
@@ -149,6 +164,7 @@ class Storage(Handler):
             kind=entry['resource_type'];metadata=dict(meta,**{k:v for k,v in entry.items() if k!='resource_type'})
             node=Node(key,kind,region,row['compartment_id'],metadata.get('object_name') or kind,'',self.name,
                 'prepare' if kind in ('ObjectStorageLifecyclePolicy','ObjectStorageRetentionRule') else 'delete',metadata)
+            node=self.classify(node)
             if kind=='ObjectStorageReplication':node=_blocked(node,'Replication detachment completion contract unresolved')
             if issues:
                 for issue in issues:
@@ -161,7 +177,7 @@ class Storage(Handler):
         for prep in preparations:
             for target in children:
                 if target.resource_type in ('ObjectStorageObject','ObjectStorageVersion'):
-                    edges.append(Edge(prep.key,target.key,'Disable lifecycle or unlocked retention before object mutations'))
+                    edges.append(Edge(prep.key,target.key,'Remove writable PAR, lifecycle or unlocked retention before object mutations'))
         return parent,children,edges
 
     def discover(self,gateway,compartment_id,region):
@@ -243,6 +259,9 @@ class Storage(Handler):
                 if kind in ('ObjectStorageObject','ObjectStorageVersion'):
                     if any(e['resource_type'] in ('ObjectStorageLifecyclePolicy','ObjectStorageRetentionRule') for e in inventory.values()):
                         raise CleanupError('Producer or retention preparation pending')
+                    if any(e['resource_type']=='ObjectStoragePAR' and _par_access(e['identity']) in _PAR_WRITE
+                           for e in inventory.values()):
+                        raise CleanupError('Write-capable PAR producer preparation pending')
                     if kind=='ObjectStorageObject' and row['versioning']!='Disabled':raise CleanupError('Exact version required')
                     if kind=='ObjectStorageVersion' and identity['is_delete_marker']:
                         etag=_text(identity.get('etag'))
