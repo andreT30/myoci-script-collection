@@ -682,6 +682,21 @@ class ReviewAnalyticsResumeTests(ExecutorSupport):
         self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
         self.assertEqual(len([e for e in self.g.analytics.events if e[0] == 'write']), 1)
 
+    def test_ineligible_live_entity_invalidates_completion_before_later_absence(self):
+        self.g.analytics.add('LogAnalyticsEntity', 'entity', owner=P)
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        self.g.analytics.rows[('LogAnalyticsEntity', 'entity')][1]['lifecycle_state'] = 'ACTIVE'
+        self.g.analytics.add('ServiceConnector', 'external', owner=T,
+                             target={'kind': 'loggingAnalytics', 'log_group_id': 'group'})
+        state = self.run_plan(plan, state)
+        self.assertTrue(state.records['entity'].get('proof_invalidations'))
+        self.g.analytics.rows.pop(('LogAnalyticsEntity', 'entity'))
+        self.g.analytics.rows.pop(('ServiceConnector', 'external'))
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+        self.assertEqual(sum(event[0] == 'write' for event in self.g.analytics.events), 1)
+
     def test_entity_purge_with_active_external_producer_stays_unresolved(self):
         self.g.analytics.add('LogAnalyticsEntity', 'entity', owner=P)
         plan, state = self.plan()
@@ -859,6 +874,21 @@ class ReviewBulkPollingTests(ExecutorSupport):
         self.assertEqual(sleeps, [5])
         self.assertEqual(len([e for e in self.g.events if e[3] == 'get_work_request']), 2)
 
+    def test_pending_original_group_missing_from_refresh_fails_closed(self):
+        plan, state = self.plan()
+        ticks = [0.0]
+        def sleep(seconds):
+            ticks[0] += seconds
+        with patch.object(executor.time, 'monotonic', side_effect=lambda: ticks[0]), patch.object(executor.time, 'sleep', side_effect=sleep):
+            state = executor.execute(plan, state, self.workspace, self.g, self.registry, P, wait_seconds=1)
+        refreshed = discover(self.g, P, self.registry)
+        self.assertNotIn('volume', refreshed.nodes)
+        with self.workspace.locked():
+            self.workspace.save_plan(refreshed)
+        with self.assertRaises(CleanupError):
+            self.run_plan(refreshed, state)
+        self.assertEqual(sum(event[0] == 'write' for event in self.g.events), 1)
+
     def test_pending_group_timeout_uses_only_remaining_budget(self):
         plan, state = self.plan()
         ticks = [0.0]
@@ -924,3 +954,217 @@ class ReviewOtherDirectResumeTests(ExecutorSupport):
         self.g.resources.pop(key)
         state = self.run_plan(plan, state)
         self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+
+class ReviewProofInvalidationTests(ExecutorSupport):
+    def test_direct_positive_proof_cannot_revive_after_reappearance(self):
+        self.add()
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        self.g.resources['volume'] = replace(self.g.resources['volume'], lifecycle_state='AVAILABLE')
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+        self.g.resources.pop('volume')
+        with self.workspace.locked():
+            _, state = self.workspace.load(P)
+        for _ in range(2):
+            state = self.run_plan(plan, state)
+            self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+        self.assertEqual(len([e for e in self.g.events if e[0] == 'write']), 1)
+        self.assertEqual(state.records['volume']['attempts'][0]['status'], 'deleted')
+
+class ReviewBulkProofInvalidationTests(ExecutorSupport):
+    def setUp(self):
+        super().setUp()
+        self.g = IntegratedGateway()
+    def test_contradicted_member_isolated_and_refresh_gets_distinct_new_group(self):
+        self.add('one')
+        self.add('two')
+        self.g.catalog = [{'name': 'Volume', 'metadata_keys': []}]
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        original = list(executor.attempt_history(state, 'one'))[0]
+        original_args = original['resources']
+        self.add('one')
+        state = self.run_plan(plan, state)
+        self.assertTrue(state.records['one'].get('proof_invalidations'))
+        self.assertNotIn('proof_invalidations', state.records['two'])
+        self.assertEqual(state.records['two']['status'], 'deleted')
+        self.assertEqual(list(executor.attempt_history(state, 'one'))[0]['resources'], original_args)
+        fresh = discover(self.g, P, self.registry)
+        state = reconcile_state(fresh, state)
+        with self.workspace.locked():
+            self.workspace.save_plan(fresh)
+        state = self.run_plan(fresh, state)
+        self.assertEqual(executor.cleanup_result(fresh, state)[1], 0)
+        attempts = list(executor.attempt_history(state, 'one'))
+        self.assertEqual(len(attempts), 2)
+        self.assertNotEqual(attempts[0]['attempt_id'], attempts[1]['attempt_id'])
+        self.assertEqual(len(list(executor.attempt_history(state, 'two'))), 1)
+
+    def test_old_shared_deleted_event_cannot_revive_after_reappearance(self):
+        self.add()
+        self.g.catalog = [{'name': 'Volume', 'metadata_keys': []}]
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        self.assertNotIn('terminal_observation', state.records['volume'])
+        self.add()
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+        self.g.resources.pop('volume')
+        with self.workspace.locked():
+            _, state = self.workspace.load(P)
+        for _ in range(2):
+            state = self.run_plan(plan, state)
+            self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+        self.assertEqual(len([e for e in self.g.events if e[0] == 'write']), 1)
+
+class ReviewLoadBalancerProofInvalidationTests(ExecutorSupport):
+    def test_old_exact_delete_work_request_cannot_revive_after_reappearance(self):
+        from compartment_cleanup.handlers.load_balancers import LoadBalancers
+        from test_load_balancers import payload
+        self.g = OtherDirectExecutionGateway()
+        self.registry = Registry({'load_balancers': LoadBalancers()})
+        self.g.add(Node('subnet', 'Subnet', R, P, '', 'AVAILABLE', '', 'unresolved', {'vcn_id': 'vcn'}))
+        self.g.add(Node('nsg', 'NetworkSecurityGroup', R, P, '', 'AVAILABLE', '', 'unresolved', {'vcn_id': 'vcn'}))
+        metadata = payload('LoadBalancer')
+        metadata['listeners'] = {}
+        metadata['backend_sets'] = {}
+        key = 'ocid1.loadbalancer.oc1.region.lb'
+        self.g.add(Node(key, 'LoadBalancer', R, P, '', 'ACTIVE', '', 'unresolved', metadata))
+        plan, state = self.plan()
+        self.g.resources[key] = replace(self.g.resources[key], lifecycle_state='DELETED')
+        state.records[key]['attempts'] = [{'attempt_id': 'original', 'request_id': 'work', 'status': 'deleted'}]
+        self.g.work_requests['work'] = {'id': 'work', 'compartment_id': P, 'load_balancer_id': key,
+                                       'type': 'DeleteLoadBalancer', 'lifecycle_state': 'SUCCEEDED', 'error_details': []}
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+        state.records[key].pop('terminal_observation', None)
+        self.g.resources[key] = replace(self.g.resources[key], lifecycle_state='ACTIVE')
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+        self.g.resources.pop(key)
+        with self.workspace.locked():
+            _, state = self.workspace.load(P)
+        for _ in range(2):
+            state = self.run_plan(plan, state)
+            self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+        self.assertFalse(any(event[0] == 'write' for event in self.g.events))
+
+class ReviewInvalidationSafetyTests(ExecutorSupport):
+    def test_explicit_refresh_allows_new_action_after_completed_identity_reappears(self):
+        self.add()
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        self.g.resources['volume'] = replace(self.g.resources['volume'], lifecycle_state='AVAILABLE')
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+        fresh = discover(self.g, P, self.registry)
+        state = reconcile_state(fresh, state)
+        with self.workspace.locked():
+            self.workspace.save_plan(fresh)
+        state = self.run_plan(fresh, state)
+        self.assertEqual(executor.cleanup_result(fresh, state)[1], 0)
+        attempts = state.records['volume']['attempts']
+        self.assertEqual(len(attempts), 2)
+        self.assertNotEqual(attempts[0]['attempt_id'], attempts[1]['attempt_id'])
+        self.g.resources.pop('volume')
+        state = self.run_plan(fresh, state)
+        self.assertEqual(executor.cleanup_result(fresh, state)[1], 0)
+
+    def test_invalidation_cannot_claim_an_ambiguous_attempt_completed(self):
+        from datetime import datetime, timezone
+        self.add()
+        plan, state = self.plan()
+        state.records['volume']['attempts'] = [{'attempt_id': 'uncertain', 'status': 'unresolved'}]
+        state.records['volume']['proof_invalidations'] = [{
+            'observed_at': datetime.now(timezone.utc).isoformat(), 'plan_created_at': plan.created_at,
+            'attempt_ids': ['uncertain'], 'completed_attempt_ids': ['uncertain'],
+            'terminal_observed_at': None, 'owner_attempt_ids': []}]
+        with self.assertRaises(CleanupError):
+            self.run_plan(plan, state)
+        self.assertFalse(any(event[0] == 'write' for event in self.g.events))
+
+    def test_malformed_invalidation_fails_before_mutation(self):
+        self.add()
+        plan, state = self.plan()
+        state.records['volume']['proof_invalidations'] = [{'attempt_ids': 'invalid'}]
+        with self.assertRaises(CleanupError):
+            self.run_plan(plan, state)
+        self.assertFalse(any(event[0] == 'write' for event in self.g.events))
+
+    def test_refresh_cannot_drop_absent_contradicted_identity_from_completion(self):
+        self.add()
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        self.g.resources['volume'] = replace(self.g.resources['volume'], lifecycle_state='AVAILABLE')
+        state = self.run_plan(plan, state)
+        self.g.resources.pop('volume')
+        fresh = discover(self.g, P, self.registry)
+        self.assertNotIn('volume', fresh.nodes)
+        state = reconcile_state(fresh, state)
+        with self.workspace.locked():
+            self.workspace.save_plan(fresh)
+        state = self.run_plan(fresh, state)
+        self.assertEqual(executor.cleanup_result(fresh, state)[1], 2)
+        self.assertEqual(sum(event[0] == 'write' for event in self.g.events), 1)
+
+    def test_initial_present_without_terminal_event_does_not_invalidate(self):
+        self.add()
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        self.assertNotIn('proof_invalidations', state.records['volume'])
+
+class ReviewStorageInvalidationTests(ExecutorSupport):
+    def setUp(self):
+        super().setUp()
+        self.g = IntegratedGateway()
+        from compartment_cleanup.handlers.storage import Storage
+        self.registry = Registry({'storage': Storage(now=lambda: self.g.storage.now)})
+
+    def test_refreshed_changed_object_gets_new_exact_batch_and_bucket_actions(self):
+        from copy import deepcopy
+        from test_storage import obj
+        bucket = deepcopy(self.g.storage.bucket)
+        self.g.storage.inventory['list_objects'] = [obj('one'), obj('two')]
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        self.g.storage.bucket = bucket
+        changed = obj('one')
+        changed['etag'] = 'changed-etag'
+        self.g.storage.inventory['list_objects'] = [changed]
+        state = self.run_plan(plan, state)
+        fresh = discover(self.g, P, self.registry)
+        state = reconcile_state(fresh, state)
+        with self.workspace.locked():
+            self.workspace.save_plan(fresh)
+        state = self.run_plan(fresh, state)
+        self.assertEqual(executor.cleanup_result(fresh, state)[1], 0)
+        self.assertEqual(sum(event[0] == 'write' for event in self.g.storage.events), 4)
+        key = next(node.key for node in fresh.nodes.values() if node.metadata.get('object_name') == 'one')
+        history = list(executor.attempt_history(state, key))
+        self.assertEqual(len(history), 2)
+        self.assertNotEqual(history[0]['attempt_id'], history[1]['attempt_id'])
+
+    def test_changed_etag_presence_invalidates_old_batch_and_owner_evidence(self):
+        from copy import deepcopy
+        from test_storage import obj
+        bucket = deepcopy(self.g.storage.bucket)
+        self.g.storage.inventory['list_objects'] = [obj('one'), obj('two')]
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+        self.g.storage.bucket = bucket
+        changed = obj('one')
+        changed['etag'] = 'changed-etag'
+        self.g.storage.inventory['list_objects'] = [changed]
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+        key = next(node.key for node in plan.nodes.values() if node.metadata.get('object_name') == 'one')
+        self.assertTrue(state.records[key].get('proof_invalidations'))
+        self.g.storage.inventory['list_objects'] = []
+        self.g.storage.bucket = None
+        with self.workspace.locked():
+            _, state = self.workspace.load(P)
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+        self.assertEqual(sum(event[0] == 'write' for event in self.g.storage.events), 2)

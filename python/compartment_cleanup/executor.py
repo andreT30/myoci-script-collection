@@ -6,7 +6,7 @@ Saved bulk hints never select a method or construct a mutation payload.
 """
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import math
 import time
 
@@ -135,6 +135,8 @@ def _new_attempt(state, nodes, token):
     for node in nodes:
         for item in resources.get(node.key,{}).get('attempts',[]):
             attempt=groups[item['bulk_attempt']] if 'bulk_attempt' in item else item
+            if attempt['attempt_id'] in {token for entry in _invalidations(resources.get(node.key, {})) for token in entry['completed_attempt_ids']}:
+                continue
             if attempt.get('status') not in ('failed','deleted'):
                 raise CleanupError('Previous ambiguous or pending operation must be reconciled first')
             if attempt.get('resource_status',{}).get(node.key) != 'failed':
@@ -298,7 +300,7 @@ def inspect_bulk(gateway, plan, request_id, *, registry=None, workspace=None, st
                 result['status']='failed' if status!='SUCCEEDED' else 'unresolved'
                 for node in nodes:
                     row=entries.get(node.key,{})
-                    if row.get('action_type')=='DELETED':
+                    if row.get('action_type')=='DELETED' and attempt['attempt_id'] not in {token for entry in _invalidations(state.records.get(node.key, {})) for token in entry['attempt_ids']}:
                         h=registry.handler_for(node)
                         if type(h) in (BlockBootVolumes,Networks) and h.corroborate_bulk_absence(gateway,registry.classify(node),scope):
                             result['resources'][node.key]='deleted'
@@ -444,17 +446,131 @@ def _corroborate_iam_absence(gateway, node, plan):
         return False
 
 
+def _invalidations(record):
+    entries = record.get('proof_invalidations', [])
+    if not isinstance(entries, list):
+        raise CleanupError('Malformed proof invalidations')
+    fields = {'observed_at', 'plan_created_at', 'attempt_ids', 'completed_attempt_ids',
+              'terminal_observed_at', 'owner_attempt_ids'}
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != fields:
+            raise CleanupError('Malformed proof invalidation entry')
+        for field in ('attempt_ids', 'completed_attempt_ids', 'owner_attempt_ids'):
+            values = entry[field]
+            if (not isinstance(values, list) or any(not isinstance(v, str) or not v for v in values)
+                    or len(set(values)) != len(values)):
+                raise CleanupError('Malformed invalidated attempt identities')
+        if not set(entry['completed_attempt_ids']) <= set(entry['attempt_ids']):
+            raise CleanupError('Malformed completed invalidation identities')
+        for field in ('observed_at', 'plan_created_at', 'terminal_observed_at'):
+            value = entry[field]
+            if value is None and field != 'observed_at':
+                continue
+            try:
+                timestamp = datetime.fromisoformat(value)
+                if timestamp.utcoffset() != timedelta(0) or timestamp > datetime.now(timezone.utc):
+                    raise ValueError('Invalid event time')
+            except (TypeError, ValueError):
+                raise CleanupError('Malformed proof invalidation timestamp')
+    return entries
+
+
+def _positive_iam_item(attempt, key):
+    work = attempt.get('work_request', {})
+    originals = attempt.get('resources', [])
+    expected = next((row for row in originals if row.get('identifier') == key), None)
+    evidence = attempt.get('resource_evidence', {}).get(key, {})
+    return (attempt.get('service') == 'identity'
+            and attempt.get('operation') == 'bulk_delete_resources'
+            and work.get('id') == attempt.get('request_id')
+            and work.get('compartment_id') == attempt.get('compartment_id')
+            and work.get('status') in _TERMINAL
+            and expected is not None and evidence.get('identifier') == key
+            and evidence.get('entity_type') == expected.get('entity_type')
+            and evidence.get('action_type') == 'DELETED')
+
+
+def _completed_attempt(attempt, key):
+    if attempt.get('status') == 'deleted' or attempt.get('resource_status', {}).get(key) == 'deleted':
+        return True
+    evidence = attempt.get('resource_evidence', {}).get(key, {})
+    if _positive_iam_item(attempt, key):
+        return True
+    if attempt.get('service') != 'object_storage' or attempt.get('operation') != 'batch_delete_objects':
+        return False
+    identity = attempt.get('bucket_identity', {}).get(key, {})
+    if (evidence.get('operation') != 'batch_delete_objects' or evidence.get('node_key') != key
+            or evidence.get('region') != attempt.get('node_regions', {}).get(key)
+            or not identity or any(evidence.get(field) != value for field, value in identity.items())):
+        return False
+    try:
+        deleted = datetime.fromisoformat(evidence['deleted_at'])
+        return deleted.utcoffset() == timedelta(0) and deleted <= datetime.now(timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _validate_invalidation_references(state, key):
+    history = {a['attempt_id']: a for a in attempt_history(state, key)}
+    for entry in _invalidations(state.records.get(key, {})):
+        if not set(entry['attempt_ids']) <= set(history):
+            raise CleanupError('Invalidation refers to unknown original attempt')
+        for token in entry['completed_attempt_ids']:
+            attempt = history[token]
+            if not _completed_attempt(attempt, key):
+                raise CleanupError('Invalidation cannot authorize replay of an ambiguous original action')
+
+
+def _proof_history(state, key):
+    invalid = {token for entry in _invalidations(state.records.get(key, {}))
+               for token in entry['attempt_ids']}
+    return [attempt for attempt in attempt_history(state, key)
+            if attempt.get('attempt_id') not in invalid]
+
+
+def _current_terminal_proof(node, record):
+    proof = record.get('terminal_observation')
+    excluded = {entry['terminal_observed_at'] for entry in _invalidations(record)}
+    return proof if _valid_terminal_proof(node, proof) and proof['observed_at'] not in excluded else None
+
+
+def _invalidate_contradicted_proofs(state, node, observation, plan):
+    if observation.status not in ('present', 'pending', 'moved'):
+        return
+    record = state.records[node.key]
+    history = _proof_history(state, node.key)
+    proof = _current_terminal_proof(node, record)
+    completed = [a for a in history if _completed_attempt(a, node.key)]
+    if proof is None and not completed and record.get('status') != 'deleted':
+        return
+    owner_key = node.metadata.get('bucket_id') if node.resource_type != 'Bucket' else None
+    owner_key = owner_key or node.metadata.get('cascade_owner')
+    owner_ids = [a['attempt_id'] for a in attempt_history(state, owner_key)] if owner_key in state.records else []
+    entry = {'observed_at': datetime.now(timezone.utc).isoformat(),
+             'plan_created_at': plan.created_at if plan is not None else None,
+             'attempt_ids': [a['attempt_id'] for a in history],
+             'completed_attempt_ids': [a['attempt_id'] for a in completed],
+             'terminal_observed_at': proof['observed_at'] if proof is not None else None,
+             'owner_attempt_ids': owner_ids}
+    record.setdefault('proof_invalidations', []).append(entry)
+    record.update(status=observation.status, detail='Fresh live evidence contradicts earlier completion; refresh discovery')
+
+
 def _observe(gateway, node, scope, handler, state, plan=None):
     record = state.records.setdefault(node.key, {'status': 'discovered', 'attempts': []})
     if node.resource_type == 'Compartment':
         try:
             row, headers = gateway.read('identity', node.region, 'get_compartment', {'compartment_id': node.key})
             if row.get('id') != node.key or row.get('compartment_id') != node.compartment_id:
-                return Observation('moved', row.get('compartment_id', ''), ' ', None, None, 'Compartment membership changed')
+                observation = Observation('moved', row.get('compartment_id', ''), ' ', None, None, 'Compartment membership changed')
+                _invalidate_contradicted_proofs(state, node, observation, plan)
+                return observation
             status = 'deleted' if row.get('lifecycle_state') == 'DELETED' else 'present' if row.get('lifecycle_state') == 'ACTIVE' else 'pending'
-            return Observation(status, node.compartment_id, row.get('lifecycle_state', ''), None, headers.get('etag'), 'Fresh IAM observation')
+            observation = Observation(status, node.compartment_id, row.get('lifecycle_state', ''), None, headers.get('etag'), 'Fresh IAM observation')
+            _invalidate_contradicted_proofs(state, node, observation, plan)
+            return observation
         except Exception:
-            proof = record.get('terminal_observation')
+            proof = _current_terminal_proof(node, record)
             if (_valid_terminal_proof(node, proof)
                     and _corroborate_iam_absence(gateway, node, plan)):
                 return Observation('deleted', node.compartment_id, 'DELETED', None, None,
@@ -463,7 +579,30 @@ def _observe(gateway, node, scope, handler, state, plan=None):
     if handler is None:
         return Observation('unresolved', node.compartment_id, '', None, None, 'Unsupported resource')
     observation = handler.inspect(gateway, node, scope)
-    history = list(attempt_history(state, node.key))
+    _invalidate_contradicted_proofs(state, node, observation, plan)
+    if observation.status == 'unresolved' and type(handler) is Storage and handler.corroborate_live_presence(gateway, node, scope):
+        _invalidate_contradicted_proofs(state, node, Observation('present', node.compartment_id, '', None, None, 'Fresh typed storage presence'), plan)
+    if (observation.status == 'unresolved' and type(handler) in (
+            BlockBootVolumes, ComputeInstances, Networks, IAMPolicies,
+            LoadBalancers, ScheduledResources, LoggingAnalytics)
+            and (record.get('status') == 'deleted' or _current_terminal_proof(node, record)
+                 or list(attempt_history(state, node.key)))):
+        # An actual typed list can prove presence even when dependency or saved
+        # metadata checks make the target ineligible. Search is not used here.
+        try:
+            found, _, _ = handler.discover(gateway, node.compartment_id, node.region)
+            present = next((live for live in found if live.key == node.key
+                            and live.resource_type == node.resource_type
+                            and live.region == node.region
+                            and live.lifecycle_state != _TERMINAL_LIFECYCLES.get(node.resource_type)), None)
+            if present is not None:
+                status = 'present' if present.compartment_id == node.compartment_id else 'moved'
+                _invalidate_contradicted_proofs(state, node, Observation(
+                    status, present.compartment_id, present.lifecycle_state, None, None,
+                    'Fresh typed identity remains present despite ineligible deletion'), plan)
+        except CleanupError:
+            pass
+    history = _proof_history(state, node.key)
     if type(handler) is Storage and history:
         evidence = history[-1].get('operation_evidence') or history[-1].get('resource_evidence', {}).get(node.key)
         if evidence:
@@ -474,7 +613,7 @@ def _observe(gateway, node, scope, handler, state, plan=None):
             observation = handler.inspect_work_request(gateway, node, request, scope)
     if observation.status == 'unresolved' and plan is not None and (node.resource_type == 'RouteTablePreparation'):
         target = plan.nodes.get(node.metadata.get('route_table_id'))
-        proof = record.get('terminal_observation')
+        proof = _current_terminal_proof(node, record)
         if target is not None and _valid_terminal_proof(node, proof):
             target_observation = _observe(gateway, Networks().classify(target), scope, Networks(), state, plan)
             if target_observation.status == 'deleted':
@@ -489,7 +628,9 @@ def _observe(gateway, node, scope, handler, state, plan=None):
                 owner_cache[owner.key] = _observe(gateway, owner, scope, owner_handler, state)
             owner_observation = owner_cache[owner.key]
             if owner_observation.status == 'deleted':
-                memberships = [a.get('cascade_membership', {}) for a in attempt_history(state, owner.key)]
+                excluded_owner_ids = {token for entry in _invalidations(record) for token in entry['owner_attempt_ids']}
+                memberships = [a.get('cascade_membership', {}) for a in _proof_history(state, owner.key)
+                               if a.get('attempt_id') not in excluded_owner_ids]
                 member_proof = any((node.key in m.get('cascade_members', []) and node.key in m.get('cascade_snapshot', {}) for m in memberships))
                 storage_proof = False
                 if type(handler) is Storage:
@@ -508,7 +649,7 @@ def _observe(gateway, node, scope, handler, state, plan=None):
                         found, probes = [], []
                     if probes and all((p.status == 'complete' for p in probes)) and (not any((n.key == node.key for n in found))):
                         observation = Observation('deleted', node.compartment_id, '', None, None, 'Durable exact member proof and positive owner deletion with complete fresh inventory')
-    proof = record.get('terminal_observation')
+    proof = _current_terminal_proof(node, record)
     if (observation.status == 'unresolved' and _valid_terminal_proof(node, proof)
             and node.resource_type == 'Policy' and type(handler) is IAMPolicies
             and _corroborate_iam_absence(gateway, node, plan)):
@@ -533,10 +674,10 @@ def _apply_observation(state, node, observation):
     record.update(status=observation.status, lifecycle_state=observation.lifecycle_state, detail=observation.detail)
     if (observation.status == 'deleted'
             and observation.lifecycle_state == _TERMINAL_LIFECYCLES.get(node.resource_type)):
-        old_proof = record.get('terminal_observation')
+        old_proof = _current_terminal_proof(node, record)
         if not _valid_terminal_proof(node, old_proof):
-            if old_proof is not None:
-                record.setdefault('terminal_history', []).append(deepcopy(old_proof))
+            if record.get('terminal_observation') is not None:
+                record.setdefault('terminal_history', []).append(deepcopy(record['terminal_observation']))
             record['terminal_observation'] = {
                 'node_key': node.key, 'resource_type': node.resource_type,
                 'compartment_id': node.compartment_id, 'region': node.region,
@@ -662,7 +803,8 @@ def execute(plan, state, workspace, gateway, registry, supplied_parent, wait_sec
     if type(wait_seconds) not in (int, float) or not math.isfinite(wait_seconds) or wait_seconds <= 0:
         raise CleanupError('Wait budget must be positive and finite')
     deadline = None
-    resource_records(state)
+    for key in resource_records(state):
+        _validate_invalidation_references(state, key)
     with workspace.locked():
         _scope_now(gateway, plan)
         _bind(registry, plan)
@@ -670,6 +812,13 @@ def execute(plan, state, workspace, gateway, registry, supplied_parent, wait_sec
             record.pop('run_blocked', None)
         for _, attempt in list(bulk_attempt_records(state)):
             if attempt.get('service') == 'identity' and attempt.get('request_id'):
+                missing = set(attempt['node_keys']) - set(plan.nodes)
+                if missing:
+                    if (attempt.get('home_region') == plan.home_region
+                            and attempt.get('region') == plan.home_region
+                            and all(_positive_iam_item(attempt, key) for key in attempt['node_keys'])):
+                        continue
+                    raise CleanupError('Pending original group lacks saved resource identities after refresh')
                 outcome = inspect_bulk(gateway, plan, attempt['request_id'], registry=registry, workspace=workspace, state=state, wait_seconds=0)
                 for key, status in outcome['resources'].items():
                     state.records[key]['status'] = status
@@ -714,7 +863,11 @@ def execute(plan, state, workspace, gateway, registry, supplied_parent, wait_sec
                     continue
                 if any((state.records.get(p, {}).get('status') not in ('deleted', 'prepared') for p in predecessors[key])):
                     continue
-                history = list(attempt_history(state, key))
+                invalidations = _invalidations(record)
+                if invalidations and datetime.fromisoformat(plan.created_at) <= datetime.fromisoformat(invalidations[-1]['observed_at']):
+                    continue
+                completed_ids = {token for entry in invalidations for token in entry['completed_attempt_ids']}
+                history = [a for a in attempt_history(state, key) if a.get('attempt_id') not in completed_ids]
                 if history and (history[-1].get('status') != 'failed' or history[-1].get('resource_status', {}).get(key, 'failed') != 'failed'):
                     continue
                 if node.action in ('unresolved', 'retain', 'cascade') or node.blockers:
@@ -789,6 +942,8 @@ def execute(plan, state, workspace, gateway, registry, supplied_parent, wait_sec
             hierarchy_drift = moved & scope or set(live.compartments) - scope or any((live.compartments.get(k) != v for k, v in plan.compartments.items() if state.records.get(k, {}).get('status') != 'deleted'))
         live, added, moved = _inventory(gateway, plan, state, registry)
         incomplete = bool(added or moved or hierarchy_drift or (not live.probes) or any((p.status != 'complete' for p in live.probes)) or any((k != plan.parent_id and state.records.get(k, {}).get('status') not in ('deleted', 'prepared') for k in plan.nodes)) or any((k != plan.parent_id and state.records.get(k, {}).get('status') not in ('deleted', 'prepared') for k in live.nodes)))
+        incomplete = incomplete or any(record.get('proof_invalidations') and record.get('status') not in ('deleted', 'prepared')
+                                       for record in resource_records(state).values())
         state.records.setdefault(plan.parent_id, {'status': 'retained', 'attempts': []})['verification'] = {'complete': not incomplete, 'added': sorted(added), 'moved': sorted(moved), 'coverage': [{'service': p.service, 'region': p.region, 'compartment_id': p.compartment_id, 'status': p.status} for p in live.probes]}
         _save(workspace, state)
         try:

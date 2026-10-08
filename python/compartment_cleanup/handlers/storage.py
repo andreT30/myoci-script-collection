@@ -274,6 +274,22 @@ class Storage(Handler):
             if not entry or entry!={'resource_type':node.resource_type,**expected}:raise CleanupError('Child identity mismatch')
         return row,headers,inventory
 
+    def corroborate_live_presence(self,gateway,node,scope):
+        """Establish typed presence independently of saved ETag or eligibility."""
+        try:
+            namespace = self._namespace(gateway,node.region)
+            if namespace != node.metadata.get('namespace'):
+                return False
+            row,_ = self._bucket(gateway,node.region,namespace,node.metadata['bucket_name'])
+            if row['compartment_id'] not in scope or row['id'] != node.metadata.get('bucket_id'):
+                return False
+            if node.resource_type == 'Bucket':
+                return row['id'] == node.key
+            inventory,_ = self._inventory(gateway,node.region,row)
+            return node.key in inventory and inventory[node.key]['resource_type'] == node.resource_type
+        except Exception:
+            return False
+
     def inspect(self,gateway,node,scope):
         try:
             if node.blockers or node.resource_type not in _TYPES:raise CleanupError('Blocked storage target')
