@@ -7,6 +7,7 @@ Search VNIC/IP resources still require their own typed ownership proof. Reserved
 public IPs and Certificates service objects persist; their IDs are never cascaded.
 """
 from dataclasses import replace
+import oci
 
 from .base import Handler
 from .core import _identity, _blocked, _scope
@@ -49,6 +50,44 @@ _BACKEND_FIELDS = {
     'LoadBalancer': {'name','ip_address','port','weight','max_connections','drain','backup','offline'},
     'NetworkLoadBalancer': {'name','ip_address','target_id','port','weight','is_drain','is_backup','is_offline'},
 }
+# Only these fixed parent configuration models start recursive schema validation.
+# Nested model types and polymorphic discriminators come from installed SDK code,
+# never from artifact-selected classes or methods. No values enter saved metadata.
+_CONFIG_MODELS = {'listeners':'Listener','backend_sets':'BackendSet','hostnames':'Hostname',
+    'certificates':'Certificate','path_route_sets':'PathRouteSet','rule_sets':'RuleSet',
+    'routing_policies':'RoutingPolicy','ssl_cipher_suites':'SSLCipherSuite'}
+
+
+def _validate_configuration_value(value, schema, models, depth=0):
+    if value is None:return
+    if depth>16:raise CleanupError('Nested configuration exceeds supported schema depth')
+    primitives={'str':str,'bool':bool,'int':int,'float':float,'DnsHealthCheckRCodes':str}
+    if schema in primitives:
+        expected=primitives[schema]
+        if type(value) is not expected and not (expected is float and type(value) is int):
+            raise CleanupError('Malformed typed configuration value')
+        return
+    if schema.startswith('list[') and schema.endswith(']'):
+        if not isinstance(value,list):raise CleanupError('Malformed nested configuration list')
+        for item in value:_validate_configuration_value(item,schema[5:-1],models,depth+1)
+        return
+    if schema.startswith('dict(str, ') and schema.endswith(')'):
+        if not isinstance(value,dict) or any(not isinstance(key,str) for key in value):
+            raise CleanupError('Malformed nested configuration map')
+        for item in value.values():_validate_configuration_value(item,schema[10:-1],models,depth+1)
+        return
+    if not isinstance(value,dict):raise CleanupError('Malformed nested configuration model')
+    model=getattr(models,schema,None)
+    if model is None:raise CleanupError('Unsupported nested configuration model')
+    if hasattr(model,'get_subtype'):
+        subtype=model.get_subtype(value)
+        if subtype==schema:raise CleanupError('Unsupported polymorphic configuration kind')
+        model=getattr(models,subtype)
+    fields=model().swagger_types
+    if set(value)-set(fields):raise CleanupError('Unknown nested configuration fields')
+    for key,item in value.items():_validate_configuration_value(item,fields[key],models,depth+1)
+
+
 _REFERENCES = ('subnet_ids','subnet_id','network_security_group_ids','certificate_ids',
                'trusted_certificate_authority_ids','reserved_public_ip_ids','backend_target_ids')
 _META = _REFERENCES + ('configuration','ip_endpoints','relationship_snapshot','cascade_members','cascade_snapshot',
@@ -86,6 +125,10 @@ def _configuration(kind,row):
                 raise CleanupError('Malformed parent configuration name')
             allowed=(_NLB_FIELDS if kind=='NetworkLoadBalancer' else _CONFIG_FIELDS)[field]
             if set(value)-allowed:raise CleanupError('Unknown owned configuration contract')
+            models=oci.load_balancer.models if kind=='LoadBalancer' else oci.network_load_balancer.models
+            # private_key is a defensive write-shape input exemption; never retain it.
+            validation={k:v for k,v in value.items() if not (field=='certificates' and k=='private_key')}
+            _validate_configuration_value(validation,_CONFIG_MODELS[field],models)
             if value.get('id') or value.get('compartment_id'):
                 raise CleanupError('Independent resource cannot be parent configuration')
             declared=value.get('certificate_name' if field=='certificates' else 'name')
@@ -142,6 +185,10 @@ def _snapshot(gateway,kind,row,region,scope):
             refs[key]={'compartment_id':live['compartment_id']}
             if live.get('lifecycle_state') in ('DELETED','TERMINATED'):
                 raise CleanupError('Reference target is terminal')
+    # Empty endpoint inventory cannot prove the absence of implicit service VNICs.
+    # Every declared subnet must be in scope independently of endpoint count.
+    if any(refs[key]['compartment_id'] not in scope for key in subnets):
+        issues.append('Implicit service network child may be outside deletion scope')
     endpoints=row.get('ip_addresses')
     if not isinstance(endpoints,list):raise CleanupError('Unknown load balancer endpoint inventory')
     safe_endpoints=[];reserved=[]
@@ -169,10 +216,6 @@ def _snapshot(gateway,kind,row,region,scope):
                 ref['private_ip']={k:ip[k] for k in ('id','compartment_id','vnic_id','subnet_id','route_table_id','lifetime') if ip.get(k) is not None}
                 ref['vnic']={k:vnic[k] for k in ('id','compartment_id','subnet_id','nsg_ids','route_table_id') if vnic.get(k) is not None}
             refs[key]=ref;reserved.append(key);item['reserved_public_ip_id']=key
-        # The LB service endpoints and implicit VNICs inherit the actual subnet
-        # compartment. This proves scope, never the identity of an arbitrary IP.
-        if not subnets or any(refs[key]['compartment_id'] not in scope for key in subnets):
-            issues.append('Implicit service network child may be outside deletion scope')
         safe_endpoints.append(item)
     # Backend.target_id is documented as an Instance/IP association. DeleteBackend
     # removes this configuration from the backend set (it never terminates Compute

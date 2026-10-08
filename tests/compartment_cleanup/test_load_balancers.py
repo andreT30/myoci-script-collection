@@ -78,11 +78,19 @@ class LoadBalancerTests(unittest.TestCase):
         self.g.resources['nsg']=replace(self.g.resources['nsg'],compartment_id=X)
         self.assertEqual(self.h.inspect(self.g,n,{P,C}).status,'unresolved')
 
-    def test_external_subnet_and_nsg_references_persist(self):
+    def test_external_subnet_blocks_even_with_empty_endpoint_inventory(self):
         self.g.resources['subnet']=replace(self.g.resources['subnet'],compartment_id=X)
         self.g.resources['nsg']=replace(self.g.resources['nsg'],compartment_id=X)
+        for kind,key,field,expected in [('LoadBalancer',LB,'subnet_ids',['subnet']),('NetworkLoadBalancer',NLB,'subnet_id','subnet')]:
+            with self.subTest(kind=kind):
+                self.add(kind);n=self.discovered(key);self.assertTrue(n.blockers)
+                self.assertEqual(n.metadata[field],expected)
+                self.assertEqual(self.h.inspect(self.g,n,{P,C}).status,'unresolved')
+
+    def test_external_nsg_reference_is_retained_with_subnet_in_scope(self):
+        self.g.resources['nsg']=replace(self.g.resources['nsg'],compartment_id=X)
         self.add();n=self.discovered();self.assertFalse(n.blockers)
-        self.assertEqual(n.metadata['subnet_ids'],['subnet'])
+        self.assertEqual(n.metadata['network_security_group_ids'],['nsg'])
         self.assertEqual(self.h.inspect(self.g,n,{P,C}).status,'present')
 
     def test_reserved_public_ip_is_live_retained_reference_never_cascade(self):
@@ -245,6 +253,42 @@ class LoadBalancerTests(unittest.TestCase):
         child=next(n for n in self.h.discover(self.g,P,R)[0] if n.action=='cascade')
         self.g.resources[LB]=replace(self.g.resources[LB],lifecycle_state='DELETED')
         self.assertEqual(self.h.inspect(self.g,replace(child,key='fake'),{P,C}).status,'unresolved')
+
+    def test_nested_unknown_owned_configuration_and_wrong_shapes_block(self):
+        unknown={'id':'ocid1.unknown.oc1..outside','compartment_id':X}
+        for kind,field,name,nested_key,value in [
+            ('LoadBalancer','backend_sets','pool','health_checker',unknown),
+            ('LoadBalancer','backend_sets','pool','session_persistence_configuration',unknown),
+            ('LoadBalancer','backend_sets','pool','lb_cookie_session_persistence_configuration',unknown),
+            ('LoadBalancer','listeners','https','connection_configuration',unknown),
+            ('LoadBalancer','path_route_sets','paths','path_routes',[{'path':'/','path_match_type':unknown}]),
+            ('LoadBalancer','routing_policies','routing','rules',[{'name':'rule','condition':'true','actions':[unknown]}]),
+            ('LoadBalancer','rule_sets','rules','items',[{'action':'ALLOW','conditions':[unknown]}]),
+            ('LoadBalancer','backend_sets','pool','health_checker',{'port':{'id':'outside'}}),
+            ('NetworkLoadBalancer','backend_sets','pool','health_checker',{'dns':unknown}),
+        ]:
+            with self.subTest(kind=kind,nested=nested_key):
+                self.g=CoreGateway();self.g.add(resource('subnet','Subnet'));self.g.add(resource('nsg','NetworkSecurityGroup'))
+                row=payload(kind);row.setdefault(field,{}).setdefault(name,{'name':name})[nested_key]=value
+                self.add(kind,row);n=self.discovered(LB if kind=='LoadBalancer' else NLB)
+                self.assertTrue(n.blockers)
+                self.assertEqual(self.h.inspect(self.g,n,{P,C}).status,'unresolved')
+                self.assertFalse(any(e[0]=='write' for e in self.g.events))
+
+    def test_sdk_typed_nested_configuration_is_accepted_without_content_leaks(self):
+        row=payload('LoadBalancer')
+        row['backend_sets']['pool']['health_checker']=oci.util.to_dict(oci.load_balancer.models.HealthChecker(protocol='HTTP',port=80,response_body_regex='fixture-secret-regex'))
+        row['backend_sets']['pool']['session_persistence_configuration']=oci.util.to_dict(oci.load_balancer.models.SessionPersistenceConfigurationDetails(cookie_name='session',disable_fallback=True))
+        row['listeners']['https']['connection_configuration']=oci.util.to_dict(oci.load_balancer.models.ConnectionConfiguration(idle_timeout=60))
+        row['path_route_sets']={'paths':oci.util.to_dict(oci.load_balancer.models.PathRouteSet(name='paths',path_routes=[oci.load_balancer.models.PathRoute(path='/',path_match_type=oci.load_balancer.models.PathMatchType(match_type='EXACT_MATCH'),backend_set_name='pool')]))}
+        row['rule_sets']={'headers':oci.util.to_dict(oci.load_balancer.models.RuleSet(name='headers',items=[oci.load_balancer.models.AddHttpRequestHeaderRule(action='ADD_HTTP_REQUEST_HEADER',header='test',value='fixture-secret-header')]))}
+        row['routing_policies']={'routing':oci.util.to_dict(oci.load_balancer.models.RoutingPolicy(name='routing',condition_language_version='V1',rules=[oci.load_balancer.models.RoutingRule(name='route',condition='true',actions=[oci.load_balancer.models.ForwardToBackendSet(name='FORWARD_TO_BACKENDSET',backend_set_name='pool')])]))}
+        self.add(metadata=row);n=self.discovered();self.assertFalse(n.blockers)
+        self.assertEqual(self.h.inspect(self.g,n,{P,C}).status,'present')
+        self.assertNotIn('fixture-secret',json.dumps(n.metadata))
+        self.g=CoreGateway();self.g.add(resource('subnet','Subnet'));self.g.add(resource('nsg','NetworkSecurityGroup'))
+        row=payload('NetworkLoadBalancer');row['backend_sets']['pool']['health_checker']=oci.util.to_dict(oci.network_load_balancer.models.HealthChecker(protocol='DNS',dns=oci.network_load_balancer.models.DnsHealthCheckerDetails(domain_name='example.test',transport_protocol='UDP',rcodes=['NOERROR'])))
+        self.add('NetworkLoadBalancer',row);self.assertFalse(self.discovered(NLB).blockers)
 
     def test_configuration_children_have_no_independent_delete(self):
         self.add();nodes,_,_=self.h.discover(self.g,P,R)
