@@ -11,11 +11,14 @@ class Handler:
     bulk_metadata builds required identifiers from freshly discovered typed fields;
     it must never infer identifiers from display names. Task 8 consumes this hook.
     """
+    late_action = False
     name = ''
     resource_types = ()
     action = 'unresolved'
     metadata_keys = ()
     reference_fields = ()
+    # Verified non-cascading outbound references only; outside resources persist.
+    retained_reference_fields = ()
     bulk_resource_types = {}
 
     def discover(self, gateway, compartment_id: str, region: str):

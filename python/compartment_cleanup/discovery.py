@@ -294,6 +294,12 @@ def discover(gateway, parent_id: str, registry, previous: Plan | None = None) ->
         edges.append(Edge(key, node.compartment_id, 'Resource belongs to compartment'))
         handler = registry.handler_for(node)
         if handler:
+            for field in handler.retained_reference_fields:
+                values = node.metadata.get(field)
+                values = values if isinstance(values,list) else [values] if values else []
+                for target in values:
+                    if isinstance(target,str) and target in nodes and target != key:
+                        edges.append(Edge(key,target,f'Retained typed reference: {field}'))
             for field in handler.reference_fields:
                 values = node.metadata.get(field)
                 values = values if isinstance(values,list) else [values] if values else []
@@ -302,6 +308,24 @@ def discover(gateway, parent_id: str, registry, previous: Plan | None = None) ->
                         nodes[key] = _blocked(nodes[key], f'External or unresolved typed reference: {field}')
                     elif target != key:
                         edges.append(Edge(key,target,f'Typed field: {field}'))
+    # Authorization policy operations follow every ordinary resource action.
+    # A policy also follows strictly descendant compartments, keeping siblings
+    # independent and preserving authorization for child-compartment deletion.
+    late = {key for key,node in nodes.items()
+            if registry.handler_for(node) and registry.handler_for(node).late_action}
+    for policy_key in late:
+        owner = nodes[policy_key].compartment_id
+        for key,node in nodes.items():
+            if key in late:
+                continue
+            if node.resource_type != 'Compartment':
+                edges.append(Edge(key,policy_key,'Code-defined late authorization action'))
+                continue
+            current = key
+            while current in compartments and current != owner:
+                current = compartments[current]
+            if key != owner and current == owner:
+                edges.append(Edge(key,policy_key,'Policy follows strictly descendant compartment deletion'))
     # Explicit association edges must stay within the proven boundary.
     safe_edges = []
     for edge in edges:

@@ -13,6 +13,15 @@ from .model import CleanupError
 
 # Static method bindings, never a method name supplied by a saved plan.
 _OPERATIONS = {
+    ("compute_management", "list_instance_pools"): ("read", lambda c, p: c.list_instance_pools(**p)),
+    ("compute_management", "list_instance_pool_instances"): ("read", lambda c, p: c.list_instance_pool_instances(**p)),
+    ("container_engine", "list_clusters"): ("read", lambda c, p: c.list_clusters(**p)),
+    ("container_engine", "list_node_pools"): ("read", lambda c, p: c.list_node_pools(**p)),
+    ("container_engine", "get_node_pool"): ("read", lambda c, p: c.get_node_pool(**p)),
+    ("network", "list_ipv6s"): ("read", lambda c, p: c.list_ipv6s(**p)),
+    ("network", "get_private_ip"): ("read", lambda c, p: c.get_private_ip(**p)),
+    ("network", "get_public_ip"): ("read", lambda c, p: c.get_public_ip(**p)),
+    ("network", "list_public_ips"): ("read", lambda c, p: c.list_public_ips(**p)),
     ("identity", "list_bulk_action_resource_types"): ("read", lambda c, p: c.list_bulk_action_resource_types(**p)),
     ("identity", "bulk_delete_resources"): ("write", lambda c, p: c.bulk_delete_resources(**p)),
     ("identity", "get_work_request"): ("read", lambda c, p: c.get_work_request(**p)),
@@ -179,6 +188,7 @@ class Gateway:
         self.home_region = None
         self.regions = []
         self.compartment_links = {}
+        self.cleanup_scope = set()
         self.compartment_records = {}
         self._clients = {}
         self._vault_endpoints = {}
@@ -207,6 +217,8 @@ class Gateway:
             'identity': oci.identity.IdentityClient,
             'search': oci.resource_search.ResourceSearchClient,
             'compute': oci.core.ComputeClient,
+            'compute_management': oci.core.ComputeManagementClient,
+            'container_engine': oci.container_engine.ContainerEngineClient,
             'network': oci.core.VirtualNetworkClient,
             'blockstorage': oci.core.BlockstorageClient,
             'object_storage': oci.object_storage.ObjectStorageClient,
@@ -393,6 +405,7 @@ def discover_scope(gateway: Gateway, parent_id: str) -> tuple[str, str, list[str
         for child in children.get(pending.pop(), []):
             descendants.add(child)
             pending.append(child)
+    gateway.cleanup_scope = set(descendants)
     gateway.compartment_links = dict(links)
     gateway.compartment_records = records
     gateway.home_region = home
