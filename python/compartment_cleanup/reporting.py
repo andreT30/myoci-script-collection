@@ -63,7 +63,13 @@ def render_report(plan: Plan, state: State) -> str:
     for probe in plan.probes:
         lines.append(f'  {_display(probe.service)} / {_display(probe.region)} / {_display(probe.compartment_id)}: {_display(probe.status)}; {_display(probe.detail)}')
     lines.extend(['', 'Pending deletions and retained journal records'])
-    for key, record in sorted(state.records.items()):
+    records = dict(state.records)
+    # Discovery already contains typed service-confirmed schedules. Show them on
+    # an initial report before an executor journal has recorded the first read.
+    for key, node in plan.nodes.items():
+        if node.lifecycle_state in {'PENDING_DELETION', 'SCHEDULING_DELETION', 'DELETING'} and records.get(key, {}).get('status', 'discovered') == 'discovered':
+            records[key] = dict(records.get(key, {}), status='pending', scheduled_at=node.metadata.get('scheduled_at'))
+    for key, record in sorted(records.items()):
         if record.get('status') == 'pending':
             timestamp = _utc(record.get('scheduled_at'))
             shown = timestamp or 'unknown UTC schedule (verification required)'

@@ -28,6 +28,10 @@ class Handler:
         return Observation('unresolved', node.compartment_id, node.lifecycle_state,
                            None, None, 'No authoritative inspection is implemented')
 
+    def refresh_node(self, gateway, node: Node, previous: Node, scope: set[str]) -> Node:
+        """Renew historical typed evidence for an already discovered identity."""
+        return node
+
     def submit(self, gateway, node: Node, observation: Observation, attempt_id: str) -> Submission:
         raise CleanupError('No resource operation is implemented')
 

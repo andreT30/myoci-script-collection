@@ -327,6 +327,18 @@ class DiscoveryTests(unittest.TestCase):
         live.probes.append(Probe('extra','r1',C,'failed',''))
         self.assertIn(C,compare_plan(saved,live)['changed'])
 
+    def test_existing_discovered_identity_renews_handler_historical_evidence(self):
+        class RenewingThings(Things):
+            def refresh_node(self,gateway,current,previous,scope):
+                if current.compartment_id not in scope: raise CleanupError('Moved')
+                return replace(current,metadata=dict(previous.metadata,**current.metadata))
+        registry=Registry({'things':RenewingThings()})
+        self.g.add(node('pending',metadata={'scheduled_at':'2026-10-20T12:34:56Z'}))
+        previous=discover(self.g,P,registry)
+        self.g.resources['pending']=replace(node('pending'),lifecycle_state='PENDING_DELETION')
+        refreshed=discover(self.g,P,registry,previous)
+        self.assertEqual(refreshed.nodes['pending'].metadata.get('scheduled_at'),'2026-10-20T12:34:56Z')
+
 
 if __name__ == '__main__':
     unittest.main()

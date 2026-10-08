@@ -239,7 +239,15 @@ def discover(gateway, parent_id: str, registry, previous: Plan | None = None) ->
         # Direct inspection is required even when both Search and list omit a
         # previously recorded resource. A 403/404 cannot establish its removal.
         for key, old in previous.nodes.items():
-            if key in nodes or old.resource_type == 'Compartment':
+            if key in nodes:
+                handler = registry.handler_for(nodes[key])
+                if handler and old.resource_type == nodes[key].resource_type:
+                    try:
+                        nodes[key] = handler.refresh_node(gateway, nodes[key], registry.classify(old), set(compartments))
+                    except Exception:
+                        nodes[key] = _blocked(nodes[key], 'Historical typed evidence cannot be renewed')
+                continue
+            if old.resource_type == 'Compartment':
                 continue
             handler = registry.handler_for(old)
             try:
