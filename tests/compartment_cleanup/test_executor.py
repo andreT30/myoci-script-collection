@@ -1121,6 +1121,89 @@ class ReviewStorageInvalidationTests(ExecutorSupport):
         from compartment_cleanup.handlers.storage import Storage
         self.registry = Registry({'storage': Storage(now=lambda: self.g.storage.now)})
 
+    def test_exact_moved_owner_preserves_pending_intent_without_reusing_it(self):
+        from test_storage import obj
+        self.g.storage.inventory['list_objects'] = [obj('one')]
+        plan, state = self.plan()
+        handler = self.registry.handlers['storage']
+        handler.bind_plan(list(plan.nodes.values()))
+        node = plan.nodes[self.g.storage.bucket['id']]
+        uncertain = {'attempt_id': 'uncertain', 'status': 'pending'}
+        state.records[node.key].update(status='pending', attempts=[dict(uncertain)])
+        self.g.storage.bucket['compartment_id'] = T
+        observation = executor._observe(self.g, node, {P}, handler, state, plan)
+        self.assertEqual(observation.status, 'moved')
+        self.assertEqual(state.records[node.key]['attempts'], [uncertain])
+        self.assertEqual(state.records[node.key]['proof_invalidations'][0]['completed_attempt_ids'], [])
+        self.g.storage.bucket = None
+        self.g.storage.inventory['list_objects'] = []
+        observation = executor._observe(self.g, node, {P}, handler, state, plan)
+        self.assertEqual(observation.status, 'unresolved')
+        self.assertEqual(state.records[node.key]['attempts'], [uncertain])
+        self.assertFalse(any(event[0] == 'write' for event in self.g.storage.events))
+
+    def test_changed_bucket_id_or_creation_is_not_exact_moved_identity(self):
+        from copy import deepcopy
+        from test_storage import obj
+        self.g.storage.inventory['list_objects'] = [obj('one')]
+        plan, original = self.plan()
+        handler = self.registry.handlers['storage']
+        handler.bind_plan(list(plan.nodes.values()))
+        node = plan.nodes[self.g.storage.bucket['id']]
+        saved = deepcopy(self.g.storage.bucket)
+        for change in ({'id': 'ocid1.bucket.oc1..different'},
+                       {'time_created': '2026-10-02T00:00:00+00:00'}):
+            with self.subTest(change=change):
+                state = deepcopy(original)
+                uncertain = {'attempt_id': 'uncertain', 'status': 'pending'}
+                state.records[node.key].update(status='pending', attempts=[deepcopy(uncertain)])
+                self.g.storage.bucket = dict(saved, compartment_id=T, **change)
+                observation = executor._observe(self.g, node, {P}, handler, state, plan)
+                self.assertEqual(observation.status, 'unresolved')
+                self.assertNotIn('proof_invalidations', state.records[node.key])
+                self.assertEqual(state.records[node.key]['attempts'], [uncertain])
+        self.assertFalse(any(event[0] == 'write' for event in self.g.storage.events))
+
+    def test_exact_moved_bucket_invalidates_owner_and_child_before_scoped_absence(self):
+        from copy import deepcopy
+        from test_storage import obj
+        for scoped_lists, present in ((True, True), (True, False), (False, True), (False, False)):
+            with self.subTest(scoped_lists=scoped_lists, child_present=present):
+                self.setUp()
+                bucket = deepcopy(self.g.storage.bucket)
+                self.g.storage.inventory['list_objects'] = [obj('one')]
+                original_items = self.g.items
+                def scoped(service, region, operation, params, endpoint=None):
+                    if scoped_lists and service == 'object_storage' and operation == 'list_buckets':
+                        live = self.g.storage.bucket
+                        if live is None or params['compartment_id'] != live['compartment_id']:
+                            return []
+                    return original_items(service, region, operation, params, endpoint)
+                self.g.items = scoped
+                plan, state = self.plan()
+                state = self.run_plan(plan, state)
+                self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+                bucket['compartment_id'] = T
+                self.g.storage.bucket = bucket
+                self.g.storage.inventory['list_objects'] = [obj('one')] if present else []
+                prior_events = len(self.g.storage.events)
+                state = self.run_plan(plan, state)
+                self.assertFalse(any(event[3] == 'head_object' for event in self.g.storage.events[prior_events:]))
+                self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+                owner = bucket['id']
+                child = next(node.key for node in plan.nodes.values() if node.resource_type == 'ObjectStorageObject')
+                self.assertTrue(state.records[owner].get('proof_invalidations'))
+                self.assertTrue(state.records[child].get('proof_invalidations'))
+                self.assertEqual(state.records[owner]['status'], 'moved')
+                self.g.storage.bucket = None
+                self.g.storage.inventory['list_objects'] = []
+                with self.workspace.locked():
+                    _, state = self.workspace.load(P)
+                state = self.run_plan(plan, state)
+                self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+                self.assertEqual(sum(event[0] == 'write' for event in self.g.storage.events), 2)
+                self.assertEqual(state.records[owner]['attempts'][0]['status'], 'deleted')
+
     def test_refreshed_changed_object_gets_new_exact_batch_and_bucket_actions(self):
         from copy import deepcopy
         from test_storage import obj

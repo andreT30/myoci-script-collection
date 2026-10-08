@@ -541,7 +541,8 @@ def _invalidate_contradicted_proofs(state, node, observation, plan):
     history = _proof_history(state, node.key)
     proof = _current_terminal_proof(node, record)
     completed = [a for a in history if _completed_attempt(a, node.key)]
-    if proof is None and not completed and record.get('status') != 'deleted':
+    if (proof is None and not completed and record.get('status') != 'deleted'
+            and not (observation.status == 'moved' and history)):
         return
     owner_key = node.metadata.get('bucket_id') if node.resource_type != 'Bucket' else None
     owner_key = owner_key or node.metadata.get('cascade_owner')
@@ -580,8 +581,12 @@ def _observe(gateway, node, scope, handler, state, plan=None):
         return Observation('unresolved', node.compartment_id, '', None, None, 'Unsupported resource')
     observation = handler.inspect(gateway, node, scope)
     _invalidate_contradicted_proofs(state, node, observation, plan)
-    if observation.status == 'unresolved' and type(handler) is Storage and handler.corroborate_live_presence(gateway, node, scope):
-        _invalidate_contradicted_proofs(state, node, Observation('present', node.compartment_id, '', None, None, 'Fresh typed storage presence'), plan)
+    if observation.status == 'unresolved' and type(handler) is Storage:
+        identity = handler.observe_live_identity(gateway, node, scope)
+        if identity is not None:
+            _invalidate_contradicted_proofs(state, node, identity, plan)
+            if identity.status == 'moved':
+                return identity
     if (observation.status == 'unresolved' and type(handler) in (
             BlockBootVolumes, ComputeInstances, Networks, IAMPolicies,
             LoadBalancers, ScheduledResources, LoggingAnalytics)

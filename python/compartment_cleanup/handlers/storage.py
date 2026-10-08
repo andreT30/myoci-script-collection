@@ -274,21 +274,32 @@ class Storage(Handler):
             if not entry or entry!={'resource_type':node.resource_type,**expected}:raise CleanupError('Child identity mismatch')
         return row,headers,inventory
 
-    def corroborate_live_presence(self,gateway,node,scope):
-        """Establish typed presence independently of saved ETag or eligibility."""
+    def observe_live_identity(self,gateway,node,scope):
+        """Read exact identity independently of deletion eligibility or scope."""
         try:
             namespace = self._namespace(gateway,node.region)
             if namespace != node.metadata.get('namespace'):
-                return False
+                return None
             row,_ = self._bucket(gateway,node.region,namespace,node.metadata['bucket_name'])
-            if row['compartment_id'] not in scope or row['id'] != node.metadata.get('bucket_id'):
-                return False
+            if (row['id'] != node.metadata.get('bucket_id')
+                    or row['time_created'] != node.metadata.get('bucket_created')):
+                return None
+            if row['compartment_id'] != node.compartment_id or row['compartment_id'] not in scope:
+                # The exact immutable owner moved. Its saved children inherit
+                # that contradiction without authorizing reads or writes on them.
+                return Observation('moved',row['compartment_id'],'',None,None,
+                                   'Fresh exact bucket identity moved outside its saved compartment')
             if node.resource_type == 'Bucket':
-                return row['id'] == node.key
-            inventory,_ = self._inventory(gateway,node.region,row)
-            return node.key in inventory and inventory[node.key]['resource_type'] == node.resource_type
+                present = row['id'] == node.key
+            else:
+                inventory,_ = self._inventory(gateway,node.region,row)
+                present = node.key in inventory and inventory[node.key]['resource_type'] == node.resource_type
+            if present:
+                return Observation('present',row['compartment_id'],'',None,None,
+                                   'Fresh typed storage identity remains present despite ineligible deletion')
         except Exception:
-            return False
+            pass
+        return None
 
     def inspect(self,gateway,node,scope):
         try:
