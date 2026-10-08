@@ -39,8 +39,8 @@ class AnalyticsGateway:
         self.events.append(('read',operation,deepcopy(params)))
         if operation==self.denied: raise CleanupError('denied')
         if operation=='list_namespaces':
-            assert params=={'compartment_id':T}
-            return {'items':[{'namespace_name':n,'compartment_id':T} for n in self.namespaces]},{}
+            assert params=={'compartment_id':self.tenancy_id}
+            return {'items':[{'namespace_name':n,'compartment_id':self.tenancy_id} for n in self.namespaces]},{}
         kind=next(k for k,v in KINDS.items() if operation=='get_'+v)
         key=params[KINDS[kind]+'_id']; namespace,row=self.rows[(kind,key)]
         if kind!='ServiceConnector': assert params['namespace_name']==namespace
@@ -219,6 +219,63 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(self.h.inspect(self.g,n,{P}).status,'present')
         row['source']['log_sources'][0]['compartment_id']=X
         self.assertEqual(self.h.inspect(self.g,n,{P}).status,'unresolved')
+    def test_terminal_rule_refresh_preserves_only_missing_typed_destinations(self):
+        self.entity(); self.rule()
+        previous=next(n for n in self.h.discover(self.g,P,R)[0] if n.key=='rule')
+        row=self.g.rows[('LogAnalyticsObjectCollectionRule','rule')][1]
+        row.update(lifecycle_state='DELETED'); row.pop('entity_id'); row.pop('log_group_id')
+        current=next(n for n in self.h.discover(self.g,P,R)[0] if n.key=='rule')
+        fresh=self.h.refresh_node(self.g,current,previous,{P})
+        self.assertEqual((fresh.metadata.get('entity_id'),fresh.metadata.get('log_group_id')),('entity','group'))
+        row['log_group_id']='fresh-group'
+        fresh=self.h.refresh_node(self.g,current,previous,{P})
+        self.assertEqual(fresh.metadata.get('log_group_id'),'fresh-group')
+    def test_terminal_connector_refresh_preserves_missing_target_evidence(self):
+        self.g.add('ServiceConnector','connector',target={'kind':'loggingAnalytics','log_group_id':'group'})
+        previous=next(n for n in self.h.discover(self.g,P,R)[0] if n.key=='connector')
+        row=self.g.rows[('ServiceConnector','connector')][1]; row['lifecycle_state']='DELETED'; row.pop('target')
+        current=next(n for n in self.h.discover(self.g,P,R)[0] if n.key=='connector')
+        fresh=self.h.refresh_node(self.g,current,previous,{P})
+        self.assertEqual((fresh.metadata.get('target_kind'),fresh.metadata.get('log_group_id')),('loggingAnalytics','group'))
+        row['lifecycle_state']='ACTIVE'
+        active=self.h.refresh_node(self.g,current,previous,{P})
+        self.assertEqual(active.lifecycle_state,'ACTIVE')
+        self.assertNotIn('log_group_id',active.metadata)
+        self.assertEqual(self.h.inspect(self.g,active,{P}).status,'unresolved')
+    def test_terminal_reference_refresh_requires_same_positive_owner(self):
+        self.entity(); self.rule()
+        previous=next(n for n in self.h.discover(self.g,P,R)[0] if n.key=='rule')
+        row=self.g.rows[('LogAnalyticsObjectCollectionRule','rule')][1]
+        row.update(lifecycle_state='DELETED'); row.pop('entity_id'); row.pop('log_group_id')
+        current=node('LogAnalyticsObjectCollectionRule','rule')
+        row['compartment_id']=X
+        fresh=self.h.refresh_node(self.g,current,previous,{P})
+        self.assertTrue(fresh.blockers); self.assertNotIn('entity_id',fresh.metadata)
+    def test_planner_refresh_retains_deleted_rule_and_connector_reference_edges(self):
+        from unittest.mock import patch
+        from compartment_cleanup.discovery import discover
+        p='ocid1.compartment.oc1..parent'; t='ocid1.tenancy.oc1..tenancy'
+        self.entity(); self.rule()
+        self.g.add('ServiceConnector','connector',target={'kind':'loggingAnalytics','log_group_id':'group'})
+        self.g.tenancy_id=t; self.g.compartment_links={p:t}; self.g.cleanup_scope={p}; self.g.compartment_records={}
+        for _,row in self.g.rows.values(): row['compartment_id']=p
+        original=self.g.items
+        def items(service,region,operation,params,endpoint=None):
+            if operation=='list_bulk_action_resource_types': return []
+            if operation=='search_resources': return [{'identifier':'group','resource_type':'LogAnalyticsLogGroup','compartment_id':p}]
+            return original(service,region,operation,params,endpoint)
+        self.g.items=items
+        with patch('compartment_cleanup.discovery.discover_scope',return_value=(t,R,[R],{p:t})):
+            registry=Registry({'logging_analytics':self.h}); previous=discover(self.g,p,registry)
+            rule=self.g.rows[('LogAnalyticsObjectCollectionRule','rule')][1]
+            rule.update(lifecycle_state='DELETED'); rule.pop('entity_id'); rule.pop('log_group_id')
+            connector=self.g.rows[('ServiceConnector','connector')][1]
+            connector['lifecycle_state']='DELETED'; connector.pop('target')
+            fresh=discover(self.g,p,registry,previous)
+        self.assertEqual(fresh.nodes['rule'].metadata.get('entity_id'),'entity')
+        self.assertEqual(fresh.nodes['connector'].metadata.get('log_group_id'),'group')
+        pairs={(e.before,e.after) for e in fresh.edges}
+        self.assertTrue({('rule','entity'),('rule','group'),('connector','group')} <= pairs)
     def test_sdk_boundaries_emit_non_cascading_flags_and_no_retry_token(self):
         import oci
         from types import SimpleNamespace

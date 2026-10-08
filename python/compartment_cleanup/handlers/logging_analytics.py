@@ -53,7 +53,7 @@ class LoggingAnalytics(Handler):
     action='delete'
     metadata_keys=tuple(sorted({'namespace','creation_source','creation_source_type','producers','target_kind','log_group_id'}
                               |{k for v in _FIELDS.values() for k in v}))
-    retained_reference_fields=('cloud_resource_id','management_agent_id','log_group_id','os_bucket_name','stream_id','bucket_name')
+    retained_reference_fields=('entity_id','cloud_resource_id','management_agent_id','log_group_id','os_bucket_name','stream_id','bucket_name')
 
     def classify(self,node):
         allowed=set(_FIELDS[node.resource_type])|{'namespace'}
@@ -198,7 +198,27 @@ class LoggingAnalytics(Handler):
         return Submission('pending',headers.get('opc-request-id'),None,'Delete accepted; positive terminal observation required')
 
     def refresh_node(self,gateway,node,previous,scope):
-        if node.resource_type!='LogAnalyticsEntity': return node
+        if node.resource_type!='LogAnalyticsEntity':
+            try:
+                if (node.key,node.resource_type,node.region,node.compartment_id)!=(previous.key,previous.resource_type,previous.region,previous.compartment_id):
+                    raise CleanupError('Historical producer identity changed')
+                if node.resource_type!='ServiceConnector' and node.metadata.get('namespace')!=previous.metadata.get('namespace'):
+                    raise CleanupError('Historical producer namespace changed')
+                row,_=self._read(gateway,node); _identity(row,node.key,previous.compartment_id)
+                if row['compartment_id'] not in scope: raise CleanupError('Historical producer owner outside scope')
+                metadata=_metadata(node.resource_type,row,node.metadata.get('namespace'))
+                # Only positive terminal identity permits missing reference fallback.
+                # An ACTIVE reappearance uses current fields exclusively, and never
+                # inherits an old destination as proof of current collection scope.
+                if row.get('lifecycle_state')=='DELETED':
+                    fields=_FIELDS[node.resource_type] if node.resource_type!='ServiceConnector' else ('target_kind','log_group_id')
+                    for field in fields:
+                        old=previous.metadata.get(field)
+                        if metadata.get(field) is None and isinstance(old,str) and old:
+                            metadata[field]=old
+                return replace(node,lifecycle_state=row.get('lifecycle_state') or '',metadata=metadata)
+            except Exception:
+                return _blocked(node,'Historical producer target evidence cannot be renewed')
         try:
             producers,ambiguous=self._producers(gateway,node,previous.metadata.get('producers',()))
             metadata=dict(node.metadata,producers=[{k:p[k] for k in _PRODUCER_KEYS} for p in producers])
