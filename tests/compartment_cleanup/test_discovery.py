@@ -235,6 +235,55 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(live.nodes['moved'].action,'unresolved')
         validate_scope(live,P)
 
+    def test_nested_cascade_unsafe_grandchild_blocks_every_ancestor(self):
+        from compartment_cleanup.graph import compute_depths
+        for reason in ('external', 'unverified'):
+            root=node('root',metadata={'cascade_members':['middle']})
+            middle=node('middle',metadata={'cascade_owner':'root','cascade_verified':True,'cascade_members':['grandchild']})
+            grandchild=node('grandchild',metadata={'cascade_owner':'middle','cascade_verified':False})
+            initial={'root':root,'middle':middle}
+            if reason == 'unverified':
+                initial['grandchild']=grandchild
+            for order in (list(initial),list(reversed(initial))):
+                nodes,edges=collapse_cascades({key:initial[key] for key in order},[])
+                depths,_=compute_depths(nodes,edges)
+                self.assertEqual(nodes['root'].action,'unresolved')
+                self.assertEqual(nodes['middle'].action,'unresolved')
+                self.assertNotIn('root',depths)
+
+    def test_lifecycle_only_refresh_revokes_saved_cascade_membership(self):
+        self.g.add(node('owner',metadata={'cascade_members':['member']}))
+        self.g.add(node('member',metadata={'cascade_owner':'owner','cascade_verified':True}))
+        saved=discover(self.g,P,self.registry)
+        self.g.add(node('owner',metadata={'cascade_members':['member','external']}))
+        class Omitted(Things):
+            def discover(self,gateway,compartment_id,region):
+                return [],[],[Probe(self.name,region,compartment_id,'complete','')]
+        live=discover(self.g,P,Registry({'things':Omitted()}),saved)
+        self.assertEqual(live.nodes['owner'].action,'unresolved')
+        self.assertEqual(live.nodes['member'].action,'unresolved')
+        self.assertNotIn('owner',live.depths)
+        self.assertIsNot(live.nodes['member'].metadata.get('cascade_verified'),True)
+        self.assertNotIn('cascade_members',live.nodes['owner'].metadata)
+
+    def test_partial_cascade_inventory_cannot_renew_old_membership_proof(self):
+        for missing in ({'owner'},{'member'},{'owner','member'}):
+            self.g=Inventory()
+            self.g.add(node('owner',metadata={'cascade_members':['member']}))
+            self.g.add(node('member',metadata={'cascade_owner':'owner','cascade_verified':True}))
+            saved=discover(self.g,P,self.registry)
+            class Partial(Things):
+                def discover(self,gateway,compartment_id,region):
+                    found,edges,probes=super().discover(gateway,compartment_id,region)
+                    return [n for n in found if n.key not in missing],edges,probes
+            live=discover(self.g,P,Registry({'things':Partial()}),saved)
+            self.assertEqual(live.nodes['owner'].action,'unresolved',str(missing))
+            self.assertNotIn('owner',live.depths,str(missing))
+            if 'owner' in missing:
+                self.assertNotIn('cascade_members',live.nodes['owner'].metadata)
+            if 'member' in missing:
+                self.assertIsNot(live.nodes['member'].metadata.get('cascade_verified'),True)
+
     def test_invalid_parent_cannot_inject_search_query(self):
         with self.assertRaises(CleanupError):
             discover(self.g,P + "' or true",self.registry)

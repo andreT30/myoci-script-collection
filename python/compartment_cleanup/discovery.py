@@ -1,4 +1,5 @@
 """Read-only inventory, typed relationship evidence, and conservative report refresh."""
+from collections import deque
 from dataclasses import replace
 from datetime import datetime, timezone
 import re
@@ -56,6 +57,31 @@ def collapse_cascades(nodes: dict[str, Node], edges: list[Edge]) -> tuple[dict[s
                     and not {nodes[member].compartment_id, node.compartment_id} <= scope)
                 for member in members)):
             result[key] = _blocked(node, 'External or unverified cascade member')
+    # A failed descendant invalidates every ancestor's cascade, regardless of
+    # dictionary order or whether the unsafe membership has its own edge.
+    parents = {}
+    for key, node in nodes.items():
+        members = node.metadata.get('cascade_members')
+        if isinstance(members, list):
+            for member in members:
+                if isinstance(member, str) and member in nodes:
+                    parents.setdefault(member, set()).add(key)
+        owner = node.metadata.get('cascade_owner')
+        if isinstance(owner, str) and owner in nodes and nodes[owner].resource_type != 'Compartment':
+            parents.setdefault(key, set()).add(owner)
+
+    def propagate_unsafe_members():
+        pending = deque(key for key, node in result.items() if node.blockers or node.action == 'unresolved')
+        visited = set(pending)
+        while pending:
+            member = pending.popleft()
+            for owner in parents.get(member, ()):
+                result[owner] = _blocked(result[owner], 'Unresolved cascade descendant')
+                if owner not in visited:
+                    visited.add(owner)
+                    pending.append(owner)
+
+    propagate_unsafe_members()
     for key, node in nodes.items():
         owner = node.metadata.get('cascade_owner')
         if owner is None and node.action != 'cascade':
@@ -82,8 +108,11 @@ def collapse_cascades(nodes: dict[str, Node], edges: list[Edge]) -> tuple[dict[s
                 result[member] = _blocked(result[member], 'Cyclic or unresolved cascade owner')
         else:
             mapped[key] = current
+    propagate_unsafe_members()
     for key, owner in mapped.items():
-        if result[key].action != 'unresolved':
+        if result[owner].action == 'unresolved' or result[owner].blockers:
+            result[key] = _blocked(result[key], 'Unresolved cascade owner')
+        elif result[key].action != 'unresolved':
             result[key] = replace(result[key], action='cascade')
     normalized = []
     seen = set()
@@ -238,6 +267,13 @@ def discover(gateway, parent_id: str, registry, previous: Plan | None = None) ->
                 kept = _blocked(kept, 'Previously recorded resource lacks authoritative in-scope verification')
                 if observation and isinstance(observation.compartment_id, str) and observation.compartment_id != old.compartment_id:
                     kept = replace(kept, metadata=dict(kept.metadata, observed_compartment_id=observation.compartment_id))
+            if any(field in old.metadata for field in ('cascade_owner', 'cascade_members', 'cascade_verified')):
+                # Observation contains lifecycle/ownership only. It cannot renew
+                # proof of a complete live cascade set, even if individual
+                # members were freshly discovered by another inventory call.
+                kept = replace(kept, metadata={k:v for k,v in kept.metadata.items()
+                                              if k not in {'cascade_members', 'cascade_verified'}})
+                kept = _blocked(kept, 'Cascade membership requires fresh typed service discovery')
             nodes[key] = kept
         # Do not lose known references merely because inventory was incomplete.
         edges.extend(e for e in previous.edges if (e.before in nodes and e.after in nodes)
