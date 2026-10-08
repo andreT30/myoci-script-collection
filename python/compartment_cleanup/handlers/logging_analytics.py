@@ -12,6 +12,7 @@ from dataclasses import replace
 
 from .base import Handler
 from .core import _identity, _scope, _compartments, _blocked
+from ..gateway import GatewayError
 from ..model import CleanupError, Node, Edge, Probe, Observation, Submission
 
 _CONTRACTS = {
@@ -227,6 +228,30 @@ class LoggingAnalytics(Handler):
             return node
         except Exception:
             return _blocked(node,'Historical producer identity cannot be renewed')
+
+    def corroborate_terminal_absence(self, gateway, node, scope):
+        """Require exact namespace inventory and renewed manual-entity closure."""
+        if node.resource_type not in _CONTRACTS or node.compartment_id not in scope:
+            return False
+        try:
+            try:
+                self._read(gateway, node)
+                return False
+            except GatewayError as error:
+                if error.status != 404:
+                    return False
+            namespace = None if node.resource_type == 'ServiceConnector' else _text(node.metadata.get('namespace'))
+            if namespace is not None and namespace not in self._namespaces(gateway, node.region):
+                return False
+            if node.resource_type == 'LogAnalyticsEntity':
+                if node.metadata.get('creation_source_type') != 'NONE':
+                    return False
+                producers, ambiguous = self._producers(gateway, node, node.metadata.get('producers', ()))
+                if ambiguous or any(p['lifecycle_state'] != 'DELETED' for p in producers):
+                    return False
+            return node.key not in self._inventory(gateway, node.region, namespace, node.resource_type)
+        except Exception:
+            return False
 
     def reconcile_record(self,gateway,node,scope,record):
         observation=self.inspect(gateway,node,scope)

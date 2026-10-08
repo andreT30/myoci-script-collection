@@ -90,6 +90,14 @@ class ExecutorTests(ExecutorSupport):
         self.assertTrue(all((n.lifecycle_state == 'TERMINATED' for n in self.g.resources.values())))
         self.assertEqual(executor.cleanup_result(p, s), (f'Cleanup complete for the recorded discovery coverage; retained parent: {P}.', 0))
 
+    def test_slow_initial_inventory_does_not_consume_runnable_cleanup_budget(self):
+        self.add()
+        p, s = self.plan()
+        with patch.object(executor.time, 'monotonic', side_effect=[0] + [10] * 100), patch.object(executor.time, 'sleep') as sleep:
+            s = self.run_plan(p, s)
+        self.assertEqual(executor.cleanup_result(p, s)[1], 0)
+        sleep.assert_not_called()
+
     def test_edited_parent_rejected_without_mutation(self):
         self.add()
         p, s = self.plan()
@@ -288,12 +296,14 @@ class IntegratedGateway(ExecutionGateway):
         self.certs.compartment_links = self.compartment_links
         self.certs.cleanup_scope = {P}
         self.storage = StorageSimulator()
+        self.storage_list_calls = []
         self.storage.bucket['compartment_id'] = P
         self.catalog = []
         self.partial = False
 
     def items(self, service, region, operation, params, endpoint=None):
         if service == 'object_storage':
+            self.storage_list_calls.append(operation)
             if operation == 'list_buckets' and (not self.storage.bucket or params['compartment_id'] != P):
                 return []
             return self.storage.items(service, region, operation, params, endpoint)
@@ -369,6 +379,47 @@ class IntegratedExecutorTests(ExecutorSupport):
         s = self.run_plan(p, s)
         self.assertFalse(any((e[0] == 'write' for e in self.g.certs.events)))
         self.assertEqual(executor.cleanup_result(p, s)[1], 2)
+
+    def test_storage_observation_snapshot_never_authorizes_writes_and_clears_on_error(self):
+        from compartment_cleanup.handlers.storage import Storage
+        from test_storage import obj
+        handler = Storage(now=lambda: self.g.storage.now)
+        self.registry = Registry({'storage': handler})
+        self.g.storage.inventory['list_objects'] = [obj('one')]
+        p, _ = self.plan()
+        handler.bind_plan(list(p.nodes.values()))
+        node = next(node for node in p.nodes.values() if node.resource_type == 'ObjectStorageObject')
+        with self.assertRaisesRegex(RuntimeError, 'read pass failed'):
+            with handler.observation_pass():
+                observation = handler.inspect(self.g, node, {P})
+                with self.assertRaises(CleanupError):
+                    handler.submit(self.g, node, observation, 'attempt')
+                with self.assertRaises(CleanupError):
+                    handler.submit_group(self.g, [node], {P}, 'attempt')
+                raise RuntimeError('read pass failed')
+        self.assertIsNone(handler._observation_cache)
+        self.assertFalse(any(event[0] == 'write' for event in self.g.storage.events))
+
+    def test_thousand_object_execute_bounds_complete_inventory_reads(self):
+        from compartment_cleanup.handlers.storage import Storage
+        from test_storage import obj
+        self.registry = Registry({'storage': Storage(now=lambda: self.g.storage.now)})
+        self.g.storage.inventory['list_objects'] = [obj(str(i)) for i in range(1000)]
+        p, s = self.plan()
+        self.g.storage.events.clear()
+        self.g.storage_list_calls.clear()
+        s = executor.execute(p, s, self.workspace, self.g, self.registry, P, wait_seconds=300)
+        counts = {operation: sum(event[3] == operation for event in self.g.storage.events)
+                  for operation in ('list_objects', 'list_object_versions')}
+        self.assertLessEqual(max(counts.values()), 12, counts)
+        self.assertEqual(executor.cleanup_result(p, s)[1], 0)
+        self.assertGreaterEqual(sum(event[3] == 'head_object' for event in self.g.storage.events), 1000)
+        self.g.storage.events.clear()
+        self.g.storage_list_calls.clear()
+        s = executor.execute(p, s, self.workspace, self.g, self.registry, P, wait_seconds=300)
+        self.assertEqual(executor.cleanup_result(p, s)[1], 0)
+        self.assertLessEqual(self.g.storage_list_calls.count('list_buckets'), 12)
+
 
     def test_storage_preparation_then_batch_then_bucket_complete(self):
         from compartment_cleanup.handlers.storage import Storage
@@ -529,3 +580,347 @@ class RouteExecutorTests(ExecutorSupport):
         s = self.run_plan(p, s)
         self.assertEqual(executor.cleanup_result(p, s)[1], 0)
         self.assertEqual(len([e for e in self.g.events if e[0] == 'write']), 3)
+
+class ReviewScheduledResumeTests(ExecutorSupport):
+    def setUp(self):
+        super().setUp()
+        self.g = IntegratedGateway()
+        from compartment_cleanup.handlers.scheduled import ScheduledResources
+        self.registry = Registry({'scheduled': ScheduledResources()})
+        original = self.g.read
+        def read(service, region, operation, params, endpoint=None):
+            try:
+                return original(service, region, operation, params, endpoint)
+            except CleanupError as error:
+                if str(error) == 'Missing identity':
+                    raise executor.GatewayError(service, operation, 404) from error
+                raise
+        self.g.read = read
+
+    def test_completed_certificate_purge_reuses_positive_history(self):
+        row = self.g.certs.add('Certificate', 'cert', owner=P)
+        plan, state = self.plan()
+        row['lifecycle_state'] = 'DELETED'
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+        self.g.certs.rows.pop((R, 'Certificate', 'cert'))
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+
+    def test_completed_unreplicated_secret_purge_reuses_positive_history(self):
+        self.g.certs.add('Vault', 'vault', owner=T, management_endpoint='https://verified.endpoint', vault_type='DEFAULT', is_primary=True)
+        self.g.certs.add('Key', 'key', owner=T, vault_id='vault', protection_mode='HSM', is_primary=True)
+        row = self.g.certs.add('Secret', 'secret', owner=P, vault_id='vault', key_id='key', is_replica=False)
+        plan, state = self.plan()
+        row['lifecycle_state'] = 'DELETED'
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+        self.g.certs.rows.pop((R, 'Secret', 'secret'))
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+
+    def test_certificate_purge_with_denied_typed_inventory_stays_unresolved(self):
+        row = self.g.certs.add('Certificate', 'cert', owner=P)
+        plan, state = self.plan()
+        row['lifecycle_state'] = 'DELETED'
+        state = self.run_plan(plan, state)
+        self.g.certs.rows.pop((R, 'Certificate', 'cert'))
+        original = self.g.items
+        def denied(service, region, operation, params, endpoint=None):
+            if operation == 'list_certificates':
+                raise executor.GatewayError(service, operation, 403)
+            return original(service, region, operation, params, endpoint)
+        self.g.items = denied
+        state = self.run_plan(plan, state)
+        self.assertNotEqual(state.records['cert']['status'], 'deleted')
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+
+class AnalyticsExecutionGateway(ExecutionGateway):
+    def __init__(self):
+        super().__init__()
+        from test_logging_analytics import AnalyticsGateway
+        self.analytics = AnalyticsGateway()
+        self.analytics.tenancy_id = T
+        self.analytics.compartment_links = self.compartment_links
+        self.analytics.cleanup_scope = {P}
+    def read(self, service, region, operation, params, endpoint=None):
+        if service in ('log_analytics', 'service_connector'):
+            try:
+                return self.analytics.read(service, region, operation, params, endpoint)
+            except KeyError as error:
+                raise executor.GatewayError(service, operation, 404) from error
+        return super().read(service, region, operation, params, endpoint)
+    def items(self, service, region, operation, params, endpoint=None):
+        if service in ('log_analytics', 'service_connector'):
+            return self.analytics.items(service, region, operation, params, endpoint)
+        return super().items(service, region, operation, params, endpoint)
+    def write(self, service, region, operation, params, endpoint=None):
+        if service in ('log_analytics', 'service_connector'):
+            return self.analytics.write(service, region, operation, params, endpoint)
+        return super().write(service, region, operation, params, endpoint)
+
+class ReviewAnalyticsResumeTests(ExecutorSupport):
+    def setUp(self):
+        super().setUp()
+        self.g = AnalyticsExecutionGateway()
+        from compartment_cleanup.handlers.logging_analytics import LoggingAnalytics
+        self.registry = Registry({'logging_analytics': LoggingAnalytics()})
+    def test_completed_manual_entity_purge_reuses_positive_history(self):
+        self.g.analytics.add('LogAnalyticsEntity', 'entity', owner=P)
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+        self.g.analytics.rows.pop(('LogAnalyticsEntity', 'entity'))
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+    def test_reappeared_manual_entity_wins_prior_terminal_history(self):
+        self.g.analytics.add('LogAnalyticsEntity', 'entity', owner=P)
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        self.g.analytics.rows[('LogAnalyticsEntity', 'entity')][1]['lifecycle_state'] = 'ACTIVE'
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+        self.assertEqual(len([e for e in self.g.analytics.events if e[0] == 'write']), 1)
+
+    def test_entity_purge_with_active_external_producer_stays_unresolved(self):
+        self.g.analytics.add('LogAnalyticsEntity', 'entity', owner=P)
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        self.g.analytics.rows.pop(('LogAnalyticsEntity', 'entity'))
+        self.g.analytics.add('ServiceConnector', 'external', owner=T,
+                             target={'kind': 'loggingAnalytics', 'log_group_id': 'group'})
+        state = self.run_plan(plan, state)
+        self.assertNotEqual(state.records['entity']['status'], 'deleted')
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+
+class ReviewProofTests(ExecutorSupport):
+    def test_nonterminal_foreign_or_malformed_proof_never_proves_absence(self):
+        from copy import deepcopy
+        self.add()
+        plan, original = self.plan()
+        self.g.resources.pop('volume')
+        proof = {
+            'node_key': 'volume', 'resource_type': 'Volume',
+            'compartment_id': P, 'region': R,
+            'lifecycle_state': 'TERMINATED',
+            'observed_at': '2026-10-08T00:00:00+00:00',
+        }
+        for changes in (
+            {'lifecycle_state': 'ACTIVE'}, {'region': 'foreign'},
+            {'observed_at': 'not a timestamp'},
+            {'observed_at': '2999-01-01T00:00:00+00:00'},
+            {'observed_at': '2026-10-08T00:00:00'},
+        ):
+            with self.subTest(changes=changes):
+                state = deepcopy(original)
+                state.records['volume']['terminal_observation'] = dict(proof, **changes)
+                state = self.run_plan(plan, state)
+                self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+                self.assertNotEqual(state.records['volume']['status'], 'deleted')
+
+    def test_positive_proof_captures_region_and_preserves_original_timestamp(self):
+        self.add()
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        proof = dict(state.records['volume']['terminal_observation'])
+        self.assertEqual(proof['region'], R)
+        self.g.resources.pop('volume')
+        state = self.run_plan(plan, state)
+        self.assertEqual(state.records['volume']['terminal_observation'], proof)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+
+    def test_policy_purged_after_positive_deleted_remains_complete(self):
+        self.g.add(Node('policy', 'Policy', R, P, '', 'ACTIVE', '', 'unresolved', {}))
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+        self.g.resources.pop('policy')
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+        self.assertEqual(len([e for e in self.g.events if e[0] == 'write']), 1)
+
+    def test_compartment_purged_after_positive_deleted_remains_complete(self):
+        child = 'ocid1.compartment.oc1..child'
+        self.g.compartment_links[child] = P
+        self.add(owner=child)
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+        self.g.deleted_compartments.clear()
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+        self.assertEqual(len([e for e in self.g.events if e[0] == 'write']), 2)
+
+    def test_purged_policy_denied_inventory_remains_unresolved(self):
+        self.g.add(Node('policy', 'Policy', R, P, '', 'ACTIVE', '', 'unresolved', {}))
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        self.g.resources.pop('policy')
+        original = self.g.items
+        def denied(service, region, operation, params, endpoint=None):
+            if operation == 'list_policies':
+                raise executor.GatewayError(service, operation, 403)
+            return original(service, region, operation, params, endpoint)
+        self.g.items = denied
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+
+    def test_purged_compartment_reappearing_under_another_parent_wins_history(self):
+        child = 'ocid1.compartment.oc1..child'
+        self.g.compartment_links[child] = P
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        self.g.deleted_compartments.clear()
+        self.g.compartment_links[child] = T
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+        self.assertEqual(state.records[child]['status'], 'moved')
+
+    def test_persistently_rejected_direct_request_attempts_once_per_run(self):
+        self.add()
+        plan, state = self.plan()
+        writes = []
+        original = self.g.write
+        def reject(service, region, operation, params, endpoint=None):
+            writes.append(operation)
+            raise executor.GatewayError(service, operation, 412, 'NoEtagMatch')
+        self.g.write = reject
+        state = self.run_plan(plan, state)
+        self.assertEqual(writes, ['delete_volume'])
+        self.assertEqual(len(state.records['volume']['attempts']), 1)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+        self.g.write = original
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+
+    def test_direct_precondition_rejection_retries_fresh_on_later_run(self):
+        self.add()
+        plan, state = self.plan()
+        original = self.g.write
+        rejected = [False]
+        def reject_once(service, region, operation, params, endpoint=None):
+            if not rejected[0]:
+                rejected[0] = True
+                self.g._event('write', service, region, operation, params, endpoint)
+                raise executor.GatewayError(service, operation, 412, 'NoEtagMatch')
+            return original(service, region, operation, params, endpoint)
+        self.g.write = reject_once
+        state = self.run_plan(plan, state)
+        self.assertEqual(state.records['volume']['attempts'][0]['status'], 'failed')
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+        original_read = self.g.read
+        def refreshed(service, region, operation, params, endpoint=None):
+            row, headers = original_read(service, region, operation, params, endpoint)
+            if operation == 'get_volume':
+                headers['etag'] = 'new-etag'
+            return row, headers
+        self.g.read = refreshed
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+        attempts = state.records['volume']['attempts']
+        self.assertEqual(attempts[0]['params']['if_match'], 'etag')
+        self.assertEqual(attempts[1]['params']['if_match'], 'new-etag')
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0]['status'], 'failed')
+        self.assertEqual(attempts[1]['status'], 'deleted')
+        self.assertNotEqual(attempts[0]['attempt_id'], attempts[1]['attempt_id'])
+
+class ReviewBulkPollingTests(ExecutorSupport):
+    def setUp(self):
+        super().setUp()
+        self.g = IntegratedGateway()
+        self.g.catalog = [{'name': 'Volume', 'metadata_keys': []}]
+        self.add()
+        original = self.g.write
+        def pending(service, region, operation, params, endpoint=None):
+            result = original(service, region, operation, params, endpoint)
+            if operation == 'bulk_delete_resources':
+                wr = self.g.work_requests[result[1]['opc-workrequest-id']]
+                wr['status'] = 'IN_PROGRESS'
+                for row in wr['resources']:
+                    row['action_type'] = 'IN_PROGRESS'
+            return result
+        self.g.write = pending
+
+    def test_pending_group_with_missing_gets_advances_inside_budget(self):
+        plan, state = self.plan()
+        ticks = [0.0]
+        sleeps = []
+        def sleep(seconds):
+            sleeps.append(seconds)
+            ticks[0] += seconds
+            for wr in self.g.work_requests.values():
+                wr['status'] = 'SUCCEEDED'
+                for row in wr['resources']:
+                    row['action_type'] = 'DELETED'
+        with patch.object(executor.time, 'monotonic', side_effect=lambda: ticks[0]), patch.object(executor.time, 'sleep', side_effect=sleep):
+            state = executor.execute(plan, state, self.workspace, self.g, self.registry, P, wait_seconds=6)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+        self.assertEqual(sleeps, [5])
+        self.assertEqual(len([e for e in self.g.events if e[3] == 'get_work_request']), 2)
+
+    def test_pending_group_timeout_uses_only_remaining_budget(self):
+        plan, state = self.plan()
+        ticks = [0.0]
+        sleeps = []
+        def sleep(seconds):
+            sleeps.append(seconds)
+            ticks[0] += seconds
+        with patch.object(executor.time, 'monotonic', side_effect=lambda: ticks[0]), patch.object(executor.time, 'sleep', side_effect=sleep):
+            state = executor.execute(plan, state, self.workspace, self.g, self.registry, P, wait_seconds=6)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 2)
+        self.assertEqual(sleeps, [5, 1])
+        self.assertEqual(ticks[0], 6)
+        self.assertEqual(len([e for e in self.g.events if e[0] == 'write']), 1)
+
+class OtherDirectExecutionGateway(ExecutionGateway):
+    def items(self, service, region, operation, params, endpoint=None):
+        kind = {'list_instances': 'Instance', 'list_load_balancers': 'LoadBalancer',
+                'list_network_load_balancers': 'NetworkLoadBalancer'}.get(operation)
+        if kind:
+            self._event('items', service, region, operation, params, endpoint)
+            return [dict(node.metadata, id=node.key, compartment_id=node.compartment_id,
+                         lifecycle_state=node.lifecycle_state)
+                    for node in self.resources.values()
+                    if node.resource_type == kind and node.compartment_id == params['compartment_id']
+                    and node.lifecycle_state not in ('DELETED', 'TERMINATED')]
+        return super().items(service, region, operation, params, endpoint)
+    def write(self, service, region, operation, params, endpoint=None):
+        result = super().write(service, region, operation, params, endpoint)
+        if operation == 'terminate_instance':
+            key = params['instance_id']
+            self.resources[key] = replace(self.resources[key], lifecycle_state='TERMINATED')
+        return result
+
+class ReviewOtherDirectResumeTests(ExecutorSupport):
+    def setUp(self):
+        super().setUp()
+        self.g = OtherDirectExecutionGateway()
+    def test_completed_instance_purge_reuses_positive_history(self):
+        from compartment_cleanup.handlers.core import ComputeInstances
+        self.registry = Registry({'compute': ComputeInstances()})
+        self.g.add(Node('instance', 'Instance', R, P, '', 'RUNNING', '', 'unresolved', {'availability_domain': 'AD'}))
+        plan, state = self.plan()
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+        self.g.resources.pop('instance')
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+    def test_completed_load_balancer_purge_reuses_positive_history(self):
+        from compartment_cleanup.handlers.load_balancers import LoadBalancers
+        from test_load_balancers import payload
+        self.registry = Registry({'load_balancers': LoadBalancers()})
+        self.g.add(Node('subnet', 'Subnet', R, P, '', 'AVAILABLE', '', 'unresolved', {'vcn_id': 'vcn'}))
+        self.g.add(Node('nsg', 'NetworkSecurityGroup', R, P, '', 'AVAILABLE', '', 'unresolved', {'vcn_id': 'vcn'}))
+        metadata = payload('LoadBalancer')
+        metadata['listeners'] = {}
+        metadata['backend_sets'] = {}
+        key = 'ocid1.loadbalancer.oc1.region.lb'
+        self.g.add(Node(key, 'LoadBalancer', R, P, '', 'ACTIVE', '', 'unresolved', metadata))
+        plan, state = self.plan()
+        self.g.resources[key] = replace(self.g.resources[key], lifecycle_state='DELETED')
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)
+        self.g.resources.pop(key)
+        state = self.run_plan(plan, state)
+        self.assertEqual(executor.cleanup_result(plan, state)[1], 0)

@@ -12,6 +12,7 @@ import oci
 from .base import Handler
 from .core import _identity, _blocked, _scope, _compartments
 from ..model import CleanupError, Node, Edge, Observation, Probe, Submission, child_key
+from ..gateway import GatewayError
 
 _CONTRACTS = {
     'Certificate': ('certificates','list_certificates','get_certificate','schedule_certificate_deletion','certificate_id','schedule_certificate_deletion_details',oci.certificates_management.models.ScheduleCertificateDeletionDetails),
@@ -568,6 +569,43 @@ class ScheduledResources(Handler):
             return replace(renewed,metadata=metadata)
         except Exception:
             return _blocked(renewed,'Historical regional or reverse consumer evidence remains unresolved')
+
+    def corroborate_terminal_absence(self, gateway, node, scope):
+        """Fresh exact inventories corroborate a caller's positive DELETED event.
+
+        KMS keys require a live verified vault endpoint. Replicated secrets and
+        nonempty vault cascades require separate current regional member proof;
+        they are deliberately excluded from this narrow purge path.
+        """
+        if node.resource_type not in ('Certificate', 'CertificateAuthority', 'CaBundle', 'Secret', 'Vault'):
+            return False
+        if node.compartment_id not in scope:
+            return False
+        if node.resource_type == 'Secret' and (
+                node.metadata.get('is_replica') is not False
+                or node.metadata.get('replication_targets')
+                or node.metadata.get('regional_replicas')):
+            return False
+        if node.resource_type == 'Vault' and node.metadata.get('cascade_members'):
+            return False
+        service, listing, operation, _, parameter, _, _ = _CONTRACTS[node.resource_type]
+        try:
+            try:
+                gateway.read(service, node.region, operation, {parameter: node.key})
+                return False
+            except GatewayError as error:
+                if error.status != 404:
+                    return False
+            seen = set()
+            for compartment in _compartments(gateway):
+                for row in gateway.items(service, node.region, listing, {'compartment_id': compartment}):
+                    _identity(row, owner=compartment)
+                    if row['id'] in seen or row['id'] == node.key:
+                        return False
+                    seen.add(row['id'])
+            return True
+        except Exception:
+            return False
 
     def reconcile_record(self,gateway,node,scope,record):
         """Task 10: inspect all scheduled nodes before rendering or retrying.

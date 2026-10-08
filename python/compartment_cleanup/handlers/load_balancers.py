@@ -11,6 +11,7 @@ import oci
 
 from .base import Handler
 from .core import _identity, _blocked, _scope
+from ..gateway import GatewayError
 from ..model import CleanupError, Node, Edge, Observation, Probe, Submission, child_key
 
 _CONTRACTS = {
@@ -342,6 +343,31 @@ class LoadBalancers(Handler):
         request=headers.get('opc-work-request-id') or headers.get('opc-workrequest-id')
         return Submission('pending',request if isinstance(request,str) and request else None,None,
             'Deletion accepted; exact terminal resource or deletion work request proof required')
+
+    def corroborate_terminal_absence(self, gateway, node, scope):
+        """Exact regional LB/NLB lists corroborate a saved positive DELETED event."""
+        if node.resource_type not in _CONTRACTS or node.compartment_id not in scope:
+            return False
+        try:
+            try:
+                _live(gateway, node.region, node.resource_type, node.key)
+                return False
+            except GatewayError as error:
+                if error.status != 404:
+                    return False
+            if not gateway.compartment_links:
+                return False
+            service, listing, _, _, _ = _CONTRACTS[node.resource_type]
+            seen = set()
+            for compartment in sorted({gateway.tenancy_id, *gateway.compartment_links}):
+                for row in gateway.items(service, node.region, listing, {'compartment_id': compartment}):
+                    _identity(row, owner=compartment)
+                    if row['id'] in seen or row['id'] == node.key:
+                        return False
+                    seen.add(row['id'])
+            return True
+        except Exception:
+            return False
 
     def inspect_work_request(self,gateway,node,request_id,scope):
         """Reconcile a journaled work request using code-defined service contracts.

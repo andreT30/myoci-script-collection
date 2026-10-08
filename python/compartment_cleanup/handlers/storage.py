@@ -6,6 +6,7 @@ that evidence through reconcile_submission. Absence by itself is never proof.
 Task 8 may group same-depth ready nodes through batch_group/submit_group; the
 server batch API is distinct from IAM bulk actions. Tracing IDs are not work IDs.
 """
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -57,6 +58,26 @@ class Storage(Handler):
     def __init__(self,now=None):
         self.now=now or (lambda:datetime.now(timezone.utc))
         self._snapshots={}
+        self._observation_cache=None
+
+    @contextmanager
+    def observation_pass(self):
+        """Share complete inventories only during one mutation-free read pass."""
+        if self._observation_cache is not None:
+            raise CleanupError('Nested storage observation pass')
+        self._observation_cache = {}
+        self._owner_observations = {}
+        self._owner_discoveries = {}
+        try:
+            yield
+        finally:
+            self._observation_cache = None
+            self._owner_observations = {}
+            self._owner_discoveries = {}
+
+    def _require_fresh_write(self):
+        if self._observation_cache is not None:
+            raise CleanupError('Storage writes cannot use an observation snapshot')
 
     def classify(self,node):
         action='prepare' if node.resource_type in ('ObjectStorageLifecyclePolicy','ObjectStorageRetentionRule') else 'delete'
@@ -87,6 +108,12 @@ class Storage(Handler):
 
     def _inventory(self,gateway,region,row):
         """Only identifiers and safe metadata survive; no object bytes or PAR URLs."""
+        cache_key = (region, row['id'], row['compartment_id'], row['namespace'],
+                     row['name'], row['time_created'], row['versioning'],
+                     row.get('object_lifecycle_policy_etag'), row.get('replication_enabled'),
+                     row.get('is_read_only'))
+        if self._observation_cache is not None and cache_key in self._observation_cache:
+            return self._observation_cache[cache_key]
         params={'namespace_name':row['namespace'],'bucket_name':row['name']}
         values={op:gateway.items(S,region,op,dict(params,fields='name,etag,timeCreated,timeModified') if op=='list_objects' else params) for op in _LISTS}
         inventory={};issues=[]
@@ -153,7 +180,10 @@ class Storage(Handler):
                 safe={k:item.get(k) for k in ('id','name','destination_region_name','destination_bucket_name',
                      'source_region_name','source_bucket_name','policy_name','status','time_created')}
                 add('ObjectStorageReplication',str(i),safe)
-        return inventory,sorted(set(issues))
+        result = inventory, sorted(set(issues))
+        if self._observation_cache is not None:
+            self._observation_cache[cache_key] = result
+        return result
 
     def _nodes(self,row,region,inventory,issues):
         meta={'bucket_id':row['id'],'bucket_name':row['name'],'namespace':row['namespace'],
@@ -286,6 +316,7 @@ class Storage(Handler):
         except Exception:return Observation('unresolved',node.compartment_id,'',None,None,'Storage identity, producer, scope or inventory unresolved; refresh report')
 
     def submit(self,gateway,node,observation,attempt_id):
+        self._require_fresh_write()
         if node.blockers or observation.status!='present':raise CleanupError('Storage action is not ready')
         fresh=self.inspect(gateway,node,_scope(gateway))
         if fresh.status!='present' or fresh.etag!=observation.etag:raise CleanupError('Storage preflight changed')
@@ -362,6 +393,7 @@ class Storage(Handler):
 
     def _batch_preflight(self,gateway,nodes,scope):
         """One complete live snapshot for one bounded group of saved identities."""
+        self._require_fresh_write()
         if not nodes or len(nodes)>1000 or any(n.resource_type!='ObjectStorageObject' or n.blockers for n in nodes):
             raise CleanupError('Storage batch is ineligible')
         first=nodes[0]

@@ -501,6 +501,33 @@ class ComputeInstances(_TypedHandler):
             if not any(child.key==node.key and child.resource_type==node.resource_type for child in children):
                 raise CleanupError('Fresh typed cascade membership is unavailable')
 
+    def corroborate_terminal_absence(self, gateway, node, scope):
+        """Corroborate recorded TERMINATED/DETACHED with exact typed lists."""
+        if node.resource_type not in ('Instance', 'VolumeAttachment', 'BootVolumeAttachment'):
+            return False
+        if node.compartment_id not in scope:
+            return False
+        try:
+            try:
+                _read(gateway, node.region, node.resource_type, node.key)
+                return False
+            except GatewayError as error:
+                if error.status != 404:
+                    return False
+            if node.resource_type != 'Instance':
+                rows = [row for _, row in _attachments(gateway, node.region, kinds=(node.resource_type,))]
+            else:
+                rows = []
+                for compartment in _compartments(gateway):
+                    current = gateway.items('compute', node.region, 'list_instances', {'compartment_id': compartment})
+                    for row in current:
+                        _identity(row, owner=compartment)
+                    rows.extend(current)
+            identities = [row['id'] for row in rows]
+            return len(identities) == len(set(identities)) and node.key not in identities
+        except Exception:
+            return False
+
     def discover(self,gateway,compartment_id,region):
         nodes,edges,probes=[],[],[]
         scope=_scope(gateway)

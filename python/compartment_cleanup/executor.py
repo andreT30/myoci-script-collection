@@ -4,6 +4,7 @@ IAM chunks use a conservative 20 (no documented IAM numeric limit verified).
 Bulk has no ETag precondition; typed preflight cannot eliminate movement races.
 Saved bulk hints never select a method or construct a mutation payload.
 """
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 import math
@@ -13,9 +14,12 @@ import oci
 
 from .discovery import _catalog
 from .graph import compute_depths, validate_scope
-from .handlers.core import BlockBootVolumes
-from .handlers.network import Networks, NETWORK_OPERATIONS
+from .handlers.core import BlockBootVolumes, ComputeInstances, IAMPolicies
+from .handlers.network import Networks, NETWORK_OPERATIONS, _TERMINAL as NETWORK_TERMINAL
 from .handlers.storage import Storage
+from .handlers.scheduled import ScheduledResources
+from .handlers.logging_analytics import LoggingAnalytics
+from .handlers.load_balancers import LoadBalancers
 from .model import CleanupError, Submission
 from .journal import bulk_record_key, bulk_attempt_records, resource_records
 
@@ -359,6 +363,87 @@ def _progress_node(plan, node, state, registry):
             member['references']['route_rules'] = []
     return replace(safe, metadata=metadata)
 
+_TERMINAL_LIFECYCLES = {
+    'Compartment': 'DELETED',
+    **IAMPolicies.terminal,
+    **BlockBootVolumes.terminal,
+    **ComputeInstances.terminal,
+    **NETWORK_TERMINAL,
+    'RouteTablePreparation': 'AVAILABLE',
+    **{kind: 'DELETED' for kind in (
+        'Certificate', 'CertificateAuthority', 'CaBundle', 'Vault', 'Key', 'Secret',
+        'LoadBalancer', 'NetworkLoadBalancer', 'LoadBalancerConfiguration',
+        'LogAnalyticsEntity', 'LogAnalyticsObjectCollectionRule',
+        'LogAnalyticsEmBridge', 'ServiceConnector',
+    )},
+}
+
+
+def _valid_terminal_proof(node, proof):
+    """Only a recorded positive typed event can authorize absence corroboration."""
+    if not isinstance(proof, dict):
+        return False
+    identity = {
+        'node_key': node.key, 'resource_type': node.resource_type,
+        'compartment_id': node.compartment_id, 'region': node.region,
+    }
+    if any(proof.get(key) != value for key, value in identity.items()):
+        return False
+    expected = _TERMINAL_LIFECYCLES.get(node.resource_type)
+    if expected is None or proof.get('lifecycle_state') != expected:
+        return False
+    timestamp = proof.get('observed_at')
+    if not isinstance(timestamp, str):
+        return False
+    try:
+        observed = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+    except ValueError:
+        return False
+    return (
+        observed.tzinfo is not None
+        and observed.utcoffset().total_seconds() == 0
+        and observed <= datetime.now(timezone.utc)
+    )
+
+
+def _corroborate_iam_absence(gateway, node, plan):
+    """Corroborate a valid earlier IAM DELETED event, never infer an event."""
+    if plan is None or node.resource_type not in ('Policy', 'Compartment'):
+        return False
+    operation, parameter = (
+        ('get_policy', 'policy_id') if node.resource_type == 'Policy'
+        else ('get_compartment', 'compartment_id')
+    )
+    try:
+        try:
+            gateway.read('identity', plan.home_region, operation, {parameter: node.key})
+            return False
+        except GatewayError as error:
+            if error.status != 404:
+                return False
+        current, moved = _scope_now(gateway, plan)
+        if moved:
+            return False
+        if node.resource_type == 'Compartment':
+            # discover_scope obtains every page of tenancy ANY inventory and
+            # validates all IAM parent chains before exposing these records.
+            return node.key not in gateway.compartment_records and node.key not in current
+        seen = set()
+        for compartment in sorted({gateway.tenancy_id, *gateway.compartment_links}):
+            rows = gateway.items('identity', plan.home_region, 'list_policies',
+                                 {'compartment_id': compartment})
+            for row in rows:
+                if (not isinstance(row, dict) or not isinstance(row.get('id'), str)
+                        or row.get('compartment_id') != compartment or row['id'] in seen):
+                    return False
+                seen.add(row['id'])
+                if row['id'] == node.key:
+                    return False
+        return True
+    except Exception:
+        return False
+
+
 def _observe(gateway, node, scope, handler, state, plan=None):
     record = state.records.setdefault(node.key, {'status': 'discovered', 'attempts': []})
     if node.resource_type == 'Compartment':
@@ -369,6 +454,11 @@ def _observe(gateway, node, scope, handler, state, plan=None):
             status = 'deleted' if row.get('lifecycle_state') == 'DELETED' else 'present' if row.get('lifecycle_state') == 'ACTIVE' else 'pending'
             return Observation(status, node.compartment_id, row.get('lifecycle_state', ''), None, headers.get('etag'), 'Fresh IAM observation')
         except Exception:
+            proof = record.get('terminal_observation')
+            if (_valid_terminal_proof(node, proof)
+                    and _corroborate_iam_absence(gateway, node, plan)):
+                return Observation('deleted', node.compartment_id, 'DELETED', None, None,
+                                   'Earlier positive IAM DELETED event and fresh authoritative hierarchy absence')
             return Observation('unresolved', node.compartment_id, '', None, None, 'IAM terminal proof unresolved')
     if handler is None:
         return Observation('unresolved', node.compartment_id, '', None, None, 'Unsupported resource')
@@ -385,7 +475,7 @@ def _observe(gateway, node, scope, handler, state, plan=None):
     if observation.status == 'unresolved' and plan is not None and (node.resource_type == 'RouteTablePreparation'):
         target = plan.nodes.get(node.metadata.get('route_table_id'))
         proof = record.get('terminal_observation')
-        if target is not None and isinstance(proof, dict) and (proof.get('node_key') == node.key):
+        if target is not None and _valid_terminal_proof(node, proof):
             target_observation = _observe(gateway, Networks().classify(target), scope, Networks(), state, plan)
             if target_observation.status == 'deleted':
                 observation = Observation('deleted', node.compartment_id, '', None, None, 'Completed route preparation and positively verified removed route table')
@@ -394,7 +484,10 @@ def _observe(gateway, node, scope, handler, state, plan=None):
         owner = plan.nodes.get(owner_key) if isinstance(owner_key, str) else None
         if owner is not None and owner.key != node.key and (not owner.metadata.get('cascade_owner')):
             owner_handler = handler
-            owner_observation = _observe(gateway, owner, scope, owner_handler, state)
+            owner_cache = handler._owner_observations if type(handler) is Storage and handler._observation_cache is not None else {}
+            if owner.key not in owner_cache:
+                owner_cache[owner.key] = _observe(gateway, owner, scope, owner_handler, state)
+            owner_observation = owner_cache[owner.key]
             if owner_observation.status == 'deleted':
                 memberships = [a.get('cascade_membership', {}) for a in attempt_history(state, owner.key)]
                 member_proof = any((node.key in m.get('cascade_members', []) and node.key in m.get('cascade_snapshot', {}) for m in memberships))
@@ -406,26 +499,50 @@ def _observe(gateway, node, scope, handler, state, plan=None):
                             storage_proof = evidence.get('http_status') == 204 or (evidence.get('operation') == 'batch_delete_objects' and bool(evidence.get('deleted_at')))
                 if member_proof or storage_proof:
                     try:
-                        found, _, probes = handler.discover(gateway, node.compartment_id, node.region)
+                        discovery_cache = handler._owner_discoveries if type(handler) is Storage and handler._observation_cache is not None else {}
+                        discovery_key = (node.compartment_id, node.region)
+                        if discovery_key not in discovery_cache:
+                            discovery_cache[discovery_key] = handler.discover(gateway, node.compartment_id, node.region)
+                        found, _, probes = discovery_cache[discovery_key]
                     except Exception:
                         found, probes = [], []
                     if probes and all((p.status == 'complete' for p in probes)) and (not any((n.key == node.key for n in found))):
                         observation = Observation('deleted', node.compartment_id, '', None, None, 'Durable exact member proof and positive owner deletion with complete fresh inventory')
     proof = record.get('terminal_observation')
-    if observation.status == 'unresolved' and isinstance(proof, dict) and (proof.get('node_key') == node.key) and (proof.get('resource_type') == node.resource_type) and (proof.get('compartment_id') == node.compartment_id) and hasattr(handler, 'corroborate_bulk_absence'):
+    if (observation.status == 'unresolved' and _valid_terminal_proof(node, proof)
+            and node.resource_type == 'Policy' and type(handler) is IAMPolicies
+            and _corroborate_iam_absence(gateway, node, plan)):
+        observation = Observation('deleted', node.compartment_id, 'DELETED', None, None,
+                                  'Earlier positive policy DELETED event and fresh complete typed inventory absence')
+    if (observation.status == 'unresolved' and _valid_terminal_proof(node, proof)
+            and type(handler) in (ScheduledResources, LoggingAnalytics, ComputeInstances, LoadBalancers)
+            and handler.corroborate_terminal_absence(gateway, node, scope)):
+        observation = Observation('deleted', node.compartment_id, proof['lifecycle_state'], None, None,
+                                  'Earlier positive typed terminal event and fresh exact service inventory absence')
+    if observation.status == 'unresolved' and _valid_terminal_proof(node, proof) and hasattr(handler, 'corroborate_bulk_absence'):
         if handler.corroborate_bulk_absence(gateway, node, scope):
             observation = Observation('deleted', node.compartment_id, proof['lifecycle_state'], None, None, 'Persisted positive terminal observation and fresh complete typed inventory absence')
     if observation.status == 'deleted':
         for attempt in record.get('attempts', []):
-            if 'bulk_attempt' not in attempt:
+            if 'bulk_attempt' not in attempt and attempt.get('status') != 'failed':
                 attempt['status'] = 'deleted'
     return observation
 
 def _apply_observation(state, node, observation):
     record = state.records.setdefault(node.key, {'status': 'discovered', 'attempts': []})
     record.update(status=observation.status, lifecycle_state=observation.lifecycle_state, detail=observation.detail)
-    if observation.status == 'deleted':
-        record['terminal_observation'] = {'node_key': node.key, 'resource_type': node.resource_type, 'compartment_id': node.compartment_id, 'lifecycle_state': observation.lifecycle_state, 'observed_at': datetime.now(timezone.utc).isoformat()}
+    if (observation.status == 'deleted'
+            and observation.lifecycle_state == _TERMINAL_LIFECYCLES.get(node.resource_type)):
+        old_proof = record.get('terminal_observation')
+        if not _valid_terminal_proof(node, old_proof):
+            if old_proof is not None:
+                record.setdefault('terminal_history', []).append(deepcopy(old_proof))
+            record['terminal_observation'] = {
+                'node_key': node.key, 'resource_type': node.resource_type,
+                'compartment_id': node.compartment_id, 'region': node.region,
+                'lifecycle_state': observation.lifecycle_state,
+                'observed_at': datetime.now(timezone.utc).isoformat(),
+            }
     if observation.status in ('present', 'pending', 'deleted') and node.action == 'schedule':
         old = record.get('scheduled_at')
         if old is not None and old != observation.scheduled_at:
@@ -439,6 +556,14 @@ def _previous(plan, state):
     done = {k for k, r in resource_records(state).items() if r.get('status') == 'deleted' and k != plan.parent_id}
     return replace(plan, nodes={k: v for k, v in plan.nodes.items() if k not in done}, compartments={k: v for k, v in plan.compartments.items() if k not in done}, edges=[e for e in plan.edges if e.before not in done and e.after not in done], probes=[p for p in plan.probes if p.compartment_id not in done], depths={k: v for k, v in plan.depths.items() if k not in done})
 
+@contextmanager
+def _observation_pass(registry):
+    with ExitStack() as stack:
+        for handler in registry.handlers.values():
+            if type(handler) is Storage:
+                stack.enter_context(handler.observation_pass())
+        yield
+
 def _inventory(gateway, plan, state, registry):
     live = discover(gateway, plan.parent_id, registry, previous=_previous(plan, state))
     gateway.cleanup_scope = set(plan.compartments)
@@ -446,11 +571,12 @@ def _inventory(gateway, plan, state, registry):
     moved = {k for k in set(live.nodes) & set(plan.nodes) if (live.nodes[k].resource_type, live.nodes[k].region, live.nodes[k].compartment_id) != (plan.nodes[k].resource_type, plan.nodes[k].region, plan.nodes[k].compartment_id)}
     moved.update((k for k, v in gateway.compartment_links.items() if k in plan.compartments and v != plan.compartments[k]))
     moved.update((k for k, n in live.nodes.items() if k in plan.nodes and n.metadata.get('observed_compartment_id', n.compartment_id) != plan.nodes[k].compartment_id))
-    for key, node in live.nodes.items():
-        if key in plan.nodes and state.records.get(key, {}).get('status') == 'deleted' and (_observe(gateway, registry.classify(node) if node.resource_type != 'Compartment' else node, set(plan.compartments), registry.handler_for(node), state).status != 'deleted'):
-            state.records[key]['status'] = 'unresolved'
-            state.records[key]['detail'] = 'Live resource reappeared after terminal proof; refresh report'
-            moved.add(key)
+    with _observation_pass(registry):
+        for key, node in live.nodes.items():
+            if key in plan.nodes and state.records.get(key, {}).get('status') == 'deleted' and (_observe(gateway, registry.classify(node) if node.resource_type != 'Compartment' else node, set(plan.compartments), registry.handler_for(node), state).status != 'deleted'):
+                state.records[key]['status'] = 'unresolved'
+                state.records[key]['detail'] = 'Live resource reappeared after terminal proof; refresh report'
+                moved.add(key)
     return (live, added, moved)
 
 class _SubmissionGateway:
@@ -504,6 +630,14 @@ def _direct(gateway, plan, state, workspace, node, handler, registry, observatio
             state.records[node.key].update(status='unresolved', detail='Typed action preflight changed; refresh report', run_blocked=True)
             _save(workspace, state)
             return
+        if (isinstance(error, GatewayError) and error.status == 412
+                and error.code == 'NoEtagMatch' and attempt['params'].get('if_match')):
+            attempt.update(status='failed', detail='Conditional request rejected before effect',
+                           error={'http_status': 412, 'code': 'NoEtagMatch'})
+            state.records[node.key].update(status='failed', run_blocked=True,
+                                           detail='Precondition rejected; a later run must revalidate')
+            _save(workspace, state)
+            return
         attempt.update(status='unresolved', detail=str(error))
         state.records[node.key].update(status='unresolved', detail='Response uncertain; reconcile before any replay')
         _save(workspace, state)
@@ -527,7 +661,7 @@ def execute(plan, state, workspace, gateway, registry, supplied_parent, wait_sec
         raise CleanupError('Journal boundary differs from plan')
     if type(wait_seconds) not in (int, float) or not math.isfinite(wait_seconds) or wait_seconds <= 0:
         raise CleanupError('Wait budget must be positive and finite')
-    deadline = time.monotonic() + wait_seconds
+    deadline = None
     resource_records(state)
     with workspace.locked():
         _scope_now(gateway, plan)
@@ -540,29 +674,31 @@ def execute(plan, state, workspace, gateway, registry, supplied_parent, wait_sec
                 for key, status in outcome['resources'].items():
                     state.records[key]['status'] = status
                 _save(workspace, state)
-        for key, old in plan.nodes.items():
-            if key == plan.parent_id:
-                continue
-            safe = _progress_node(plan, old, state, registry)
-            observation = _observe(gateway, safe, scope, registry.handler_for(safe), state, plan)
-            if state.records.get(key, {}).get('status') == 'deleted' and observation.status == 'unresolved' and any((a.get('resource_status', {}).get(key) == 'deleted' for a in attempt_history(state, key))):
-                continue
-            _apply_observation(state, safe, observation)
-        _save(workspace, state)
-        live, added, moved = _inventory(gateway, plan, state, registry)
-        hierarchy_drift = moved & scope or set(live.compartments) - scope or any((live.compartments.get(k) != v for k, v in plan.compartments.items() if state.records.get(k, {}).get('status') != 'deleted'))
-        while not hierarchy_drift and time.monotonic() < deadline:
-            _bind(registry, plan)
+        with _observation_pass(registry):
             for key, old in plan.nodes.items():
                 if key == plan.parent_id:
                     continue
                 safe = _progress_node(plan, old, state, registry)
                 observation = _observe(gateway, safe, scope, registry.handler_for(safe), state, plan)
-                if state.records.get(key, {}).get('status') == 'deleted' and observation.status == 'unresolved':
-                    continue
-                if state.records.get(key, {}).get('status') == 'failed':
+                if state.records.get(key, {}).get('status') == 'deleted' and observation.status == 'unresolved' and any((a.get('resource_status', {}).get(key) == 'deleted' for a in attempt_history(state, key))):
                     continue
                 _apply_observation(state, safe, observation)
+        _save(workspace, state)
+        live, added, moved = _inventory(gateway, plan, state, registry)
+        hierarchy_drift = moved & scope or set(live.compartments) - scope or any((live.compartments.get(k) != v for k, v in plan.compartments.items() if state.records.get(k, {}).get('status') != 'deleted'))
+        while not hierarchy_drift:
+            _bind(registry, plan)
+            with _observation_pass(registry):
+                for key, old in plan.nodes.items():
+                    if key == plan.parent_id:
+                        continue
+                    safe = _progress_node(plan, old, state, registry)
+                    observation = _observe(gateway, safe, scope, registry.handler_for(safe), state, plan)
+                    if state.records.get(key, {}).get('status') == 'deleted' and observation.status == 'unresolved':
+                        continue
+                    if state.records.get(key, {}).get('status') == 'failed':
+                        continue
+                    _apply_observation(state, safe, observation)
             _save(workspace, state)
             depths, blocked = compute_depths(live.nodes, live.edges)
             predecessors = {k: set() for k in live.nodes}
@@ -586,8 +722,16 @@ def execute(plan, state, workspace, gateway, registry, supplied_parent, wait_sec
                 ready.append(node)
             if not ready:
                 pending = [key for key, record in resource_records(state).items() if key in plan.nodes and record.get('status') == 'pending' and (plan.nodes[key].resource_type == 'Compartment' or registry.classify(plan.nodes[key]).action != 'schedule')]
-                if not pending:
+                pending_groups = any(
+                    attempt.get('service') == 'identity'
+                    and attempt.get('request_id')
+                    and attempt.get('status') == 'pending'
+                    for _, attempt in bulk_attempt_records(state)
+                )
+                if not pending and not pending_groups:
                     break
+                if deadline is None:
+                    deadline = time.monotonic() + wait_seconds
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
@@ -612,9 +756,11 @@ def execute(plan, state, workspace, gateway, registry, supplied_parent, wait_sec
                     outcome = inspect_bulk(gateway, candidate, submission.request_id, registry=registry, workspace=workspace, state=state, wait_seconds=0)
                     for key, status in outcome['resources'].items():
                         state.records[key]['status'] = status
-                for node in selected:
-                    if type(registry.handler_for(node)) is Storage:
-                        _apply_observation(state, node, _observe(gateway, node, scope, registry.handler_for(node), state, plan))
+                _bind(registry, plan)
+                with _observation_pass(registry):
+                    for node in selected:
+                        if type(registry.handler_for(node)) is Storage:
+                            _apply_observation(state, node, _observe(gateway, node, scope, registry.handler_for(node), state, plan))
                 _save(workspace, state)
             else:
                 node = ready[0]
