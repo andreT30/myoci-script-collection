@@ -240,6 +240,37 @@ class NetworkTests(unittest.TestCase):
         self.assertNotIn(prep.key,current.nodes)
         self.assertFalse(current.nodes['v'].blockers)
         self.assertEqual(current.nodes['rt'].metadata['route_rules'],[])
+    def test_default_routes_without_verified_preparation_block_discovery(self):
+        for target in ('ocid1.drg.oc1..unsupported','ip'):
+            with self.subTest(target=target):
+                self.g=NetworkGateway();self.vcn()
+                if target=='ip':self.g.add(resource('ip','PrivateIp',state='',metadata={'subnet_id':'s','vnic_id':'nic','lifetime':'EPHEMERAL','ip_state':'ASSIGNED'}))
+                rules=[{'network_entity_id':target,'destination':'0.0.0.0/0','destination_type':'CIDR_BLOCK'}]
+                self.g.resources['rt']=replace(self.g.resources['rt'],metadata={'vcn_id':'v','route_rules':rules})
+                self.g.rows['list_route_tables'][0]['route_rules']=rules
+                nodes,edges,_=self.h.discover(self.g,P,R);by={n.key:n for n in nodes}
+                self.assertTrue(by['rt'].blockers)
+                self.assertTrue(by['v'].blockers)
+                self.assertEqual(by['v'].action,'unresolved')
+                by,edges=collapse_cascades(by,edges);depths,blocked=compute_depths(by,edges)
+                self.assertNotIn('v',depths);self.assertIn('v',blocked)
+                self.assertFalse(any(n.resource_type=='RouteTablePreparation' for n in nodes))
+    def test_foreign_resolver_requires_explicit_valid_reverse_view_references(self):
+        for value in (None,'missing',[{}],[{'view_id':None}],[{'view_id':''}],[]):
+            with self.subTest(attached_views=value):
+                self.g=NetworkGateway();self.vcn()
+                row={'id':'foreign-resolver','compartment_id':X,'attached_vcn_id':'outside-vcn',
+                    'default_view_id':'other-view','is_protected':True,'lifecycle_state':'ACTIVE','rules':[],'endpoints':[]}
+                if value!='missing':row['attached_views']=value
+                summary=oci.util.to_dict(oci.dns.models.ResolverSummary(id=row['id'],compartment_id=X,
+                    attached_vcn_id=row['attached_vcn_id'],default_view_id=row['default_view_id'],is_protected=True,lifecycle_state='ACTIVE'))
+                self.g.rows['list_resolvers'].append(summary)
+                self.g.add(resource(row['id'],'Resolver',X,'ACTIVE',row))
+                vcn=self.by_id()['v']
+                if value==[]:
+                    self.assertFalse(vcn.blockers);self.assertEqual(self.h.inspect(self.g,vcn,{P,C}).status,'present')
+                else:
+                    self.assertTrue(vcn.blockers);self.assertEqual(vcn.action,'unresolved')
     def test_sdk_exact_parameters(self):
         config={'tenancy':'ocid1.tenancy.oc1..t','region':'eu-frankfurt-1'}
         client=oci.core.VirtualNetworkClient(config,signer=Mock(spec=oci.auth.signers.InstancePrincipalsSecurityTokenSigner));calls=[]

@@ -212,6 +212,13 @@ def _cascade(gateway,inventory,node,scope):
         if row.get('vcn_id')!=node.key or row['compartment_id'] not in scope:
             raise CleanupError('External or nonreciprocal default')
         _safe_consumers(inventory,key,scope,True)
+        if kind=='RouteTable' and row.get('route_rules'):
+            _validate_routes(gateway,inventory,row,scope)
+            gateway_ids={gateway_row['id'] for gateway_kind in _GATEWAYS
+                         for gateway_row in inventory.rows[gateway_kind]
+                         if gateway_row['compartment_id'] in scope}
+            if not any(rule['network_entity_id'] in gateway_ids for rule in row['route_rules']):
+                raise CleanupError('Default routes have no verified planned preparation')
         children.append(_node(kind,row,node.region))
     resolvers=[r for r in inventory.rows['Resolver'] if r.get('attached_vcn_id')==node.key]
     if len(resolvers)!=1:raise CleanupError('Default DNS resolver coverage is unresolved')
@@ -227,8 +234,10 @@ def _cascade(gateway,inventory,node,scope):
     if view['compartment_id'] not in scope or view.get('is_protected') is not True or view.get('lifecycle_state')!='ACTIVE':
         raise CleanupError('External or unprotected DNS default view')
     for other in inventory.rows['Resolver']:
-        views=other.get('attached_views') or []
-        if not isinstance(views,list):raise CleanupError('Unknown resolver view references')
+        views=other.get('attached_views')
+        if (not isinstance(views,list) or any(not isinstance(view,dict)
+                or not isinstance(view.get('view_id'),str) or not view['view_id'].strip() for view in views)):
+            raise CleanupError('Unknown resolver view references')
         if other['id']!=resolver['id'] and (other.get('default_view_id')==view_id or any(v.get('view_id')==view_id for v in views)):
             raise CleanupError('Shared default DNS view')
     children.extend((_node('Resolver',resolver,node.region),_node('View',view,node.region)))
