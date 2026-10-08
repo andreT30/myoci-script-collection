@@ -120,6 +120,7 @@ _OPERATIONS = {
     ("network_load_balancer", "get_network_load_balancer"): ("read", lambda c, p: c.get_network_load_balancer(**p)),
     ("network_load_balancer", "delete_network_load_balancer"): ("write", lambda c, p: c.delete_network_load_balancer(**p)),
     ("network_load_balancer", "get_work_request"): ("read", lambda c, p: c.get_work_request(**p)),
+    ("network_load_balancer", "list_work_request_errors"): ("read", lambda c, p: c.list_work_request_errors(**p)),
     ("certificates", "list_certificates"): ("read", lambda c, p: c.list_certificates(**p)),
     ("certificates", "get_certificate"): ("read", lambda c, p: c.get_certificate(**p)),
     ("certificates", "list_certificate_authorities"): ("read", lambda c, p: c.list_certificate_authorities(**p)),

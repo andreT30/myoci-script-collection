@@ -56,7 +56,7 @@ def _read(gateway,region,kind,key):
     row,headers=gateway.read(service,region,operation,params)
     return _identity(row,key),headers
 
-def _active(kind,row):return row.get('lifecycle_state')!=_TERMINAL.get(kind,'TERMINATED')
+def _active(kind,row):return row.get('lifecycle_state')!=('DELETED' if kind in ('LoadBalancer','NetworkLoadBalancer') else _TERMINAL.get(kind,'TERMINATED'))
 
 def _references(kind,row):
     """Only documented association fields, never generic OCID/text scanning."""
@@ -64,7 +64,7 @@ def _references(kind,row):
     fields=('vcn_id','route_table_id','dhcp_options_id','subnet_id')
     for field in fields:
         if row.get(field):refs.append(row[field])
-    for field in ('security_list_ids','nsg_ids'):
+    for field in ('security_list_ids','nsg_ids','network_security_group_ids','subnet_ids'):
         values=row.get(field,[])
         if values is None:values=[]
         if not isinstance(values,list) or any(not isinstance(v,str) or not v for v in values):
@@ -196,7 +196,7 @@ def _safe_consumers(inventory,key,scope,allow_live):
     inventory.complete();consumers=inventory.consumers(key)
     for kind,row in consumers:
         if row['compartment_id'] not in scope:raise CleanupError('External network consumer')
-        if kind not in (*NETWORK_OPERATIONS,'Vnic','PrivateIp'):
+        if kind not in (*NETWORK_OPERATIONS,'Vnic','PrivateIp','LoadBalancer','NetworkLoadBalancer'):
             raise CleanupError('Unsupported attached network consumer')
     if consumers and not allow_live:raise CleanupError('Network resource still has live consumers')
     return consumers
