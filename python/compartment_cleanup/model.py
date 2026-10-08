@@ -74,6 +74,7 @@ class Submission:
     request_id: str | None
     scheduled_at: str | None
     detail: str
+    operation_evidence: dict | None = None
 
 
 @dataclass

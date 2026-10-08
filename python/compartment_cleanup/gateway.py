@@ -101,6 +101,16 @@ _OPERATIONS = {
     ("blockstorage", "list_boot_volume_backups"): ("read", lambda c, p: c.list_boot_volume_backups(**p)),
     ("blockstorage", "get_boot_volume_backup"): ("read", lambda c, p: c.get_boot_volume_backup(**p)),
     ("blockstorage", "delete_boot_volume_backup"): ("write", lambda c, p: c.delete_boot_volume_backup(**p)),
+    ("object_storage", "head_object"): ("read", lambda c, p: c.head_object(**p)),
+    ("object_storage", "list_preauthenticated_requests"): ("read", lambda c, p: c.list_preauthenticated_requests(**p)),
+    ("object_storage", "get_object_lifecycle_policy"): ("read", lambda c, p: c.get_object_lifecycle_policy(**p)),
+    ("object_storage", "get_retention_rule"): ("read", lambda c, p: c.get_retention_rule(**p)),
+    ("object_storage", "list_replication_sources"): ("read", lambda c, p: c.list_replication_sources(**p)),
+    ("object_storage", "get_replication_policy"): ("read", lambda c, p: c.get_replication_policy(**p)),
+    ("object_storage", "delete_preauthenticated_request"): ("write", lambda c, p: c.delete_preauthenticated_request(**p)),
+    ("object_storage", "delete_object_lifecycle_policy"): ("write", lambda c, p: c.delete_object_lifecycle_policy(**p)),
+    ("object_storage", "delete_retention_rule"): ("write", lambda c, p: c.delete_retention_rule(**p)),
+    ("object_storage", "batch_delete_objects"): ("write", lambda c, p: c.batch_delete_objects(**p)),
     ("object_storage", "get_namespace"): ("read", lambda c, p: c.get_namespace(**p)),
     ("object_storage", "list_buckets"): ("read", lambda c, p: c.list_buckets(**p)),
     ("object_storage", "get_bucket"): ("read", lambda c, p: c.get_bucket(**p)),
@@ -276,6 +286,12 @@ class Gateway:
             raise GatewayError(service, operation) from None
         data = _normalize(response.data)
         headers = {str(k).lower(): v for k, v in response.headers.items()}
+        # Reserved internal metadata preserves the actual SDK HTTP status; it is
+        # not inferred from a missing response body or supplied by an OCI header.
+        headers.pop('__http_status__', None)
+        status = getattr(response, 'status', None)
+        if service == 'object_storage' and type(status) is int:
+            headers['__http_status__'] = status
         if service == 'kms_vault' and operation == 'get_vault':
             self._remember_vault(region, params, data)
         return data, headers

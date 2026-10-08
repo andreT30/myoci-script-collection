@@ -119,3 +119,93 @@ class Simulator:
                     pending.append(key)
         return self.tenancy_id, self.home_region, list(self.regions), {
             key: self.compartment_links[key] for key in scope}
+
+
+class StorageSimulator(Simulator):
+    """Bucket-owned metadata only; writes enforce identity and mutate inventory."""
+    def __init__(self):
+        super().__init__()
+        self.cleanup_scope = {'parent', 'child'}
+        self.namespace = 'canonical'
+        self.bucket = {'id': 'ocid1.bucket.oc1..original', 'namespace': self.namespace,
+                       'name': 'bucket', 'compartment_id': 'child',
+                       'time_created': '2026-10-01T00:00:00+00:00', 'etag': 'bucket-etag',
+                       'versioning': 'Disabled', 'replication_enabled': False,
+                       'is_read_only': False, 'object_lifecycle_policy_etag': None}
+        self.inventory = {op: [] for op in ('list_objects', 'list_object_versions',
+            'list_multipart_uploads', 'list_preauthenticated_requests',
+            'list_retention_rules', 'list_replication_policies', 'list_replication_sources')}
+        self.policy = {'items': [], 'time_created': '2026-10-01T00:00:00+00:00'}
+        self.write_headers = {'__http_status__': 204}
+        self.destination = None
+
+    def read(self, service, region, operation, params, endpoint=None):
+        self._event('read', service, region, operation, params, endpoint)
+        if operation == 'get_namespace': return self.namespace, {'__http_status__': 200}
+        if params.get('namespace_name') != self.namespace: raise CleanupError('Wrong namespace')
+        if operation == 'get_bucket':
+            bucket = self.bucket if params['bucket_name'] == 'bucket' else self.destination
+            if not bucket: raise GatewayError(service, operation, 404)
+            return deepcopy(bucket), {'etag': bucket['etag'], '__http_status__': 200}
+        if operation == 'get_object_lifecycle_policy':
+            if not self.bucket['object_lifecycle_policy_etag']: raise GatewayError(service, operation, 404)
+            return deepcopy(self.policy), {'etag': self.bucket['object_lifecycle_policy_etag']}
+        if operation == 'get_retention_rule':
+            row = next(r for r in self.inventory['list_retention_rules'] if r['id'] == params['retention_rule_id'])
+            return deepcopy(row), {'etag': row['etag']}
+        if operation == 'head_object':
+            rows = self.inventory['list_object_versions'] if 'version_id' in params else self.inventory['list_objects']
+            row = next((r for r in rows if r['name'] == params['object_name'] and
+                ('version_id' not in params or r['version_id'] == params['version_id'])), None)
+            if not row or row.get('is_delete_marker'): raise GatewayError(service, operation, 404)
+            return None, {'etag': row['etag'], 'version-id': row.get('version_id'), '__http_status__': 200}
+        raise CleanupError('Unexpected storage read')
+
+    def items(self, service, region, operation, params, endpoint=None):
+        if (service, region, operation) in self.pages:
+            return super().items(service, region, operation, params, endpoint)
+        self._event('items', service, region, operation, params, endpoint)
+        if params.get('namespace_name') != self.namespace: raise CleanupError('Wrong namespace')
+        if operation == 'list_buckets': return [{'name': 'bucket'}] if self.bucket else []
+        return deepcopy(self.inventory[operation])
+
+    def write(self, service, region, operation, params, endpoint=None):
+        self._event('write', service, region, operation, params, endpoint)
+        if params.get('namespace_name') != self.namespace or params.get('bucket_name') != 'bucket':
+            raise CleanupError('Wrong write identity')
+        headers = deepcopy(self.write_headers)
+        if operation == 'delete_object':
+            op = 'list_object_versions' if 'version_id' in params else 'list_objects'
+            row = next(r for r in self.inventory[op] if r['name'] == params['object_name'] and
+                ('version_id' not in params or r['version_id'] == params['version_id']))
+            if params.get('if_match') != row['etag']: raise GatewayError(service, operation, 412)
+            self.inventory[op].remove(row)
+            if 'version_id' in params: headers['version-id'] = params['version_id']
+        elif operation == 'abort_multipart_upload':
+            rows = self.inventory['list_multipart_uploads']
+            rows.remove(next(r for r in rows if r['upload_id'] == params['upload_id'] and r['object'] == params['object_name']))
+        elif operation == 'delete_preauthenticated_request':
+            rows = self.inventory['list_preauthenticated_requests']
+            rows.remove(next(r for r in rows if r['id'] == params['par_id']))
+        elif operation == 'delete_object_lifecycle_policy':
+            if params['if_match'] != self.bucket['object_lifecycle_policy_etag']: raise GatewayError(service, operation, 412)
+            self.bucket['object_lifecycle_policy_etag'] = None
+        elif operation == 'delete_retention_rule':
+            rows = self.inventory['list_retention_rules']
+            row = next(r for r in rows if r['id'] == params['retention_rule_id'])
+            if params['if_match'] != row['etag']: raise GatewayError(service, operation, 412)
+            rows.remove(row)
+        elif operation == 'delete_bucket':
+            if any(self.inventory.values()) or self.bucket['object_lifecycle_policy_etag']: raise GatewayError(service, operation, 409)
+            if params['if_match'] != self.bucket['etag']: raise GatewayError(service, operation, 412)
+            self.bucket = None
+        elif operation == 'batch_delete_objects':
+            deleted=[]
+            for item in params['batch_delete_objects_details'].objects:
+                row=next(r for r in self.inventory['list_objects'] if r['name']==item.object_name)
+                if row['etag']!=item.if_match: raise GatewayError(service, operation, 412)
+                self.inventory['list_objects'].remove(row)
+                deleted.append({'object_name':item.object_name,'time_last_modified':self.now.isoformat()})
+            return {'deleted':deleted,'failed':[]}, headers
+        else: raise CleanupError('Unexpected storage write')
+        return None, headers
