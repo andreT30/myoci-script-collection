@@ -37,8 +37,11 @@ def validate_scope(plan: Plan, supplied_parent: str) -> set[str]:
             raise CleanupError("Resource is outside the recorded compartment scope")
         if node.action == "retain" and key != plan.parent_id:
             raise CleanupError("Only the chosen parent may be retained")
-        if node.resource_type == "Compartment" and key not in scope:
-            raise CleanupError("Compartment node is outside the recorded scope")
+        if node.resource_type == "Compartment":
+            if key not in scope:
+                raise CleanupError("Compartment node is outside the recorded scope")
+            if node.compartment_id != plan.compartments[key]:
+                raise CleanupError("Compartment owner does not match recorded hierarchy")
     for edge in plan.edges:
         if edge.before not in plan.nodes or edge.after not in plan.nodes:
             raise CleanupError("Dependency references an external or unknown target")
@@ -65,6 +68,8 @@ def compute_depths(nodes: dict[str, Node], edges: list[Edge]) -> tuple[dict[str,
             continue
         successors[edge.before].add(edge.after)
         predecessors[edge.after].add(edge.before)
+        if nodes[edge.before].action == "retain" and nodes[edge.after].action != "retain":
+            reasons.setdefault(edge.after, set()).add(f"Retained predecessor cannot be removed: {edge.before}")
     # Forward topological traversal leaves cycles and their downstream nodes.
     incoming = {key: len(value) for key, value in predecessors.items()}
     ready = deque(key for key, count in incoming.items() if count == 0)

@@ -156,6 +156,7 @@ def _edge(data):
 
 def _probe(data):
     _object(data, [field.name for field in fields(Probe)], "probe")
+    _text(data["status"], "probe status")
     if data["status"] not in {"complete", "failed", "not_supported"}:
         raise CleanupError("Invalid probe status")
     return Probe(**{key: _text(value, key, empty=key in {"detail", "region"}) for key, value in data.items()})

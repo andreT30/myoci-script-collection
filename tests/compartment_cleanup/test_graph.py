@@ -126,6 +126,39 @@ class GraphTests(unittest.TestCase):
         data["nodes"]["parent"]["compartment_id"] = "external_owner"
         self.assertEqual(validate_scope(plan_from_dict(data), "parent"), {"parent", "child"})
 
+    def test_retained_predecessor_blocks_downstream_prerequisite(self):
+        nodes = {"parent": node("parent", action="retain"), "a": node("a"), "b": node("b")}
+        depths, blockers = compute_depths(nodes, [Edge("parent", "a", "ref"), Edge("a", "b", "ref")])
+        self.assertEqual(depths, {})
+        self.assertEqual(set(blockers), {"a", "b"})
+
+    def test_resource_can_be_removed_before_retained_parent(self):
+        nodes = {"parent": node("parent", action="retain"), "a": node("a")}
+        self.assertEqual(compute_depths(nodes, [Edge("a", "parent", "containment")]), ({"a": 1}, {}))
+
+    def test_child_compartment_node_requires_recorded_owner(self):
+        data = payload()
+        data["nodes"]["child"] = copy.deepcopy(data["nodes"]["parent"])
+        data["nodes"]["child"].update(key="child", action="delete", compartment_id="child")
+        with self.assertRaises(CleanupError):
+            plan_from_dict(data)
+        data["nodes"]["child"]["compartment_id"] = "parent"
+        self.assertEqual(validate_scope(plan_from_dict(data), "parent"), {"parent", "child"})
+
+    def test_unknown_compartment_node_identity_is_rejected(self):
+        data = payload()
+        data["nodes"]["external"] = copy.deepcopy(data["nodes"]["parent"])
+        data["nodes"]["external"].update(key="external", action="delete", compartment_id="parent")
+        with self.assertRaises(CleanupError):
+            plan_from_dict(data)
+
+    def test_unhashable_probe_status_is_a_cleanup_error(self):
+        data = payload()
+        data["probes"] = [{"service": "example", "region": "r", "compartment_id": "parent",
+                           "status": [], "detail": ""}]
+        with self.assertRaises(CleanupError):
+            plan_from_dict(data)
+
     def test_supplied_parent_must_match_saved_scope(self):
         with self.assertRaises(CleanupError):
             validate_scope(plan_from_dict(payload()), "other")
