@@ -33,6 +33,34 @@ def render_report(plan: Plan, state: State) -> str:
         node = plan.nodes[key]
         record = state.records.get(key, {})
         lines.append(f'  {_display(key)} | {_display(node.resource_type)} | {_display(node.display_name)} | method: {_display(node.handler)} / {_display(node.action)} | status: {_display(record.get("status", "discovered"))}')
+        # Only identifying fields and disclosed retained-resource effects are
+        # printable; nested configuration, tags and secret metadata stay private.
+        for field in ('object_name', 'version_id', 'bucket_name', 'kms_key_id',
+                      'vault_id', 'key_id', 'vcn_id', 'peer_id',
+                      'issuer_certificate_authority_id', 'entity_id', 'cloud_resource_id',
+                      'management_agent_id', 'log_group_id', 'os_bucket_name',
+                      'stream_id', 'subnet_id', 'em_entities_compartment_id'):
+            value = node.metadata.get(field)
+            if isinstance(value, str) and value:
+                lines.append(f'    {_display(field)}: {_display(value)}')
+        for field in ('subnet_ids', 'network_security_group_ids', 'certificate_ids',
+                      'trusted_certificate_authority_ids', 'backend_target_ids',
+                      'reserved_public_ip_ids'):
+            values = node.metadata.get(field)
+            if isinstance(values, list):
+                for value in values:
+                    if isinstance(value, str):
+                        lines.append(f'    Reference retained by this action {_display(field)}: {_display(value)}')
+        volumes = node.metadata.get('preserved_volume_ids')
+        if isinstance(volumes, list):
+            for value in volumes:
+                if isinstance(value, str):
+                    lines.append('    Volume preserved by instance termination: ' + _display(value))
+        ips = node.metadata.get('retained_public_ips')
+        if isinstance(ips, list):
+            for value in ips:
+                if isinstance(value, dict) and isinstance(value.get('id'), str):
+                    lines.append('    Reserved public IP retained and automatically unassigned: ' + _display(value['id']))
         for edge in plan.edges:
             if edge.before == key:
                 lines.append(f'    before {_display(edge.after)}: {_display(edge.evidence)}')
@@ -73,8 +101,13 @@ def render_report(plan: Plan, state: State) -> str:
     for key, record in sorted(records.items()):
         if record.get('status') == 'pending':
             timestamp = _utc(record.get('scheduled_at'))
-            shown = timestamp or 'unknown UTC schedule (verification required)'
-            lines.append(f'  Cannot finish cleanup: {_display(key)} is pending deletion until {shown}; rerun after that time and verify its removal.')
+            if timestamp:
+                lines.append(f'  Cannot finish cleanup: {_display(key)} is pending deletion until {timestamp}; rerun after that time and verify its removal.')
+            elif (record.get('lifecycle_state') in ('PENDING_DELETION', 'SCHEDULING_DELETION')
+                  or (plan.nodes.get(key) and plan.nodes[key].action == 'schedule')):
+                lines.append(f'  Cannot finish cleanup: {_display(key)} has a pending scheduled deletion with unknown UTC schedule (verification required); rerun to verify its removal.')
+            else:
+                lines.append(f'  Cannot finish cleanup: {_display(key)} has an asynchronous deletion in progress; rerun to verify its removal.')
             if timestamp:
                 pending.append(timestamp)
         if key not in plan.nodes:

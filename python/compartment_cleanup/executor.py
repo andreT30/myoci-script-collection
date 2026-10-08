@@ -4,7 +4,7 @@ IAM chunks use a conservative 20 (no documented IAM numeric limit verified).
 Bulk has no ETag precondition; typed preflight cannot eliminate movement races.
 Saved bulk hints never select a method or construct a mutation payload.
 """
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import math
@@ -794,7 +794,7 @@ def _direct(gateway, plan, state, workspace, node, handler, registry, observatio
     state.records[node.key].update(status=submission.status, scheduled_at=submission.scheduled_at, detail=submission.detail)
     _save(workspace, state)
 
-def execute(plan, state, workspace, gateway, registry, supplied_parent, wait_seconds=300):
+def execute(plan, state, workspace, gateway, registry, supplied_parent, wait_seconds=300, *, already_locked=False):
     """Execute only saved identities; each run has a positive bounded wait budget.
 
     Local/schema/authentication/scope failures raise CleanupError (CLI exit 1).
@@ -810,7 +810,9 @@ def execute(plan, state, workspace, gateway, registry, supplied_parent, wait_sec
     deadline = None
     for key in resource_records(state):
         _validate_invalidation_references(state, key)
-    with workspace.locked():
+    if already_locked:
+        workspace._writer()
+    with nullcontext() if already_locked else workspace.locked():
         _scope_now(gateway, plan)
         _bind(registry, plan)
         for record in resource_records(state).values():
@@ -956,6 +958,54 @@ def execute(plan, state, workspace, gateway, registry, supplied_parent, wait_sec
         except Exception as error:
             raise JournalError('Cannot persist final cleanup report') from error
     return state
+
+def reconcile_report(plan, state, workspace, gateway, registry):
+    """Refresh durable evidence using reads only, while the caller holds its lock.
+
+    Observe old identities before discovery excludes confirmed removals. Sharing
+    the executor's proof logic preserves ambiguity and invalidated history.
+    """
+    workspace._writer()
+    plan_to_dict(plan)
+    state_to_dict(state)
+    scope = validate_scope(plan, plan.parent_id)
+    tenancy, home, _, _ = discover_scope(gateway, plan.parent_id)
+    if tenancy != plan.tenancy_id or home != plan.home_region:
+        raise CleanupError('Authenticated tenancy or home region changed')
+    gateway.cleanup_scope = scope
+    _bind(registry, plan)
+    for key in resource_records(state):
+        _validate_invalidation_references(state, key)
+    for _, attempt in list(bulk_attempt_records(state)):
+        if attempt.get('service') != 'identity' or not attempt.get('request_id'):
+            continue
+        if set(attempt['node_keys']) - set(plan.nodes):
+            if (attempt.get('home_region') == plan.home_region
+                    and attempt.get('region') == plan.home_region
+                    and all(_positive_iam_item(attempt, key) for key in attempt['node_keys'])):
+                continue
+            raise CleanupError('Pending original group lacks saved resource identities after refresh')
+        outcome = inspect_bulk(gateway, plan, attempt['request_id'], registry=registry,
+                               workspace=workspace, state=state, wait_seconds=0)
+        for key, status in outcome['resources'].items():
+            state.records[key]['status'] = status
+        _save(workspace, state)
+    with _observation_pass(registry):
+        for key, old in plan.nodes.items():
+            if key == plan.parent_id:
+                continue
+            safe = _progress_node(plan, old, state, registry)
+            observation = _observe(gateway, safe, scope, registry.handler_for(safe), state, plan)
+            if (state.records.get(key, {}).get('status') == 'deleted'
+                    and observation.status == 'unresolved'
+                    and any(a.get('resource_status', {}).get(key) == 'deleted'
+                            for a in _proof_history(state, key))):
+                continue
+            _apply_observation(state, safe, observation)
+    state.records.setdefault(plan.parent_id, {'status': 'retained', 'attempts': []}).pop('verification', None)
+    _save(workspace, state)
+    return _previous(plan, state)
+
 
 def cleanup_result(plan, state):
     """Return the exact coverage-qualified outcome; internal groups are not nodes."""

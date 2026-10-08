@@ -155,6 +155,17 @@ class Workspace:
         self._scope(state)
         self._replace('state.json', json.dumps(state_to_dict(state), indent=2, sort_keys=True, allow_nan=False) + '\n')
 
+    def read_report(self) -> str:
+        self._writer()
+        target = self.path / 'report.txt'
+        _regular(target)
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, 'r', encoding='utf-8') as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise CleanupError('Invalid managed report')
+            return stream.read()
+
     def save_report(self, text: str) -> None:
         self._replace('report.txt', text)
 

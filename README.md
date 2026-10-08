@@ -1,19 +1,23 @@
 # OCI script collection
 
 Utilities for OCI resource inventory, service-limit lookup, VM reporting, IAM
-policy analysis, bulk tag updates, and Linux 9 SSH recovery.
+policy analysis, compartment-tree cleanup, bulk tag updates, and Linux 9 SSH recovery.
 
 ## Prerequisites
 
-All tools expect an authenticated and configured [OCI CLI](https://docs.oracle.com/en-us/iaas/Content/API/SDKDocs/cliinstall.htm)
+The existing inventory, lookup, tag and Bash tools expect an authenticated and configured [OCI CLI](https://docs.oracle.com/en-us/iaas/Content/API/SDKDocs/cliinstall.htm)
 and an identity with permission to read or modify the resources involved.
 
 - `python3` is required by every Python tool and by the policy hierarchy tool.
+- Compartment cleanup uses the OCI Python SDK directly (Python 3.10+, OCI SDK
+  2.187.0+) and supports API keys or instance principals; it does not require
+  the OCI CLI. See the [cleanup guide](docs/oci-compartment-cleanup.md).
 - `jq` is required by the Bash tools.
 - The OCI CLI configuration defaults to `~/.oci/config` and the `DEFAULT`
   profile unless the tool or environment specifies otherwise.
 - CSV, TSV, generated bulk-tag JSON, Python caches, local environments, and
-  tests are intentionally excluded from Git by `.gitignore`.
+  pre-existing tests are intentionally excluded from Git by `.gitignore`. The
+  compartment-cleanup test suite is tracked.
 
 Make the scripts executable after cloning if the filesystem did not preserve
 their modes:
@@ -27,11 +31,23 @@ chmod +x bash/*.sh python/*.py
 | Tool | Purpose | Changes OCI resources? |
 | --- | --- | --- |
 | `python/oci_tenancy_inventory.py` | Inventory searchable resources across all subscribed regions and optionally extract tags | No |
+| [Compartment-tree cleanup](docs/oci-compartment-cleanup.md) (`python/oci_compartment_cleanup.py`) | Plan and repeat supported-resource deletion while retaining the parent compartment | **Yes**, in explicit delete mode; report mode reads OCI only |
 | `python/oci_limit_lookup.py` | Look up service limits, usage, and available capacity | No |
 | `bash/list_all_vms_in_tenancy.sh` | List VM details across all subscribed regions | No |
 | `bash/count_policy_hierarchy_statements.sh` | Count IAM policy statements along every compartment path | No |
 | `python/bulk_edit_tags_single_compartment.py` | Apply a defined tag to supported resources in one compartment | **Yes** |
 | `oci_linux9_opc_ssh_recovery.md` | Recovery guide for the `opc` user's SSH access | Procedural guide |
+
+## Compartment-tree cleanup
+
+**These commands create local files. Preserve the entire work directory until cleanup is finished.**
+
+Install the SDK requirements, generate a report, review its dependencies and
+coverage gaps, then use explicit deletion with the same parent confirmation.
+Repeat that delete command as scheduled deletions mature. OCI has no universal
+inventory; unsupported resources and unresolved evidence keep cleanup incomplete.
+The selected parent is retained. Read the [cleanup guide](docs/oci-compartment-cleanup.md)
+for commands, authentication, scope/cascade effects, coverage and local artifacts.
 
 ## Tenancy resource inventory
 
