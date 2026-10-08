@@ -10,6 +10,7 @@ import oci
 from .base import Handler
 from .core import _identity, _blocked, _scope, _compartments
 from ..model import CleanupError, Node, Edge, Observation, Probe, Submission, child_key
+from ..gateway import GatewayError
 
 NETWORK_OPERATIONS = {
     'Vcn': ('list_vcns','get_vcn','delete_vcn','vcn_id'),
@@ -346,6 +347,22 @@ class Networks(Handler):
                 _safe_consumers(inventory,node.key,scope,False)
             return Observation('present',owner,state,None,headers.get('etag'),'Fresh identity, ownership and typed associations')
         except Exception:return Observation('unresolved',node.compartment_id,'',None,None,'Live scope, identity or network relationships unresolved; refresh report')
+
+    def corroborate_bulk_absence(self,gateway,node,scope):
+        """Corroborate an already recorded exact bulk DELETED event."""
+        try:
+            if node.resource_type not in NETWORK_OPERATIONS or node.compartment_id not in scope:
+                return False
+            try:
+                live,_=_read(gateway,node.region,node.resource_type,node.key)
+                if live['compartment_id']!=node.compartment_id or live.get('lifecycle_state')!=_TERMINAL[node.resource_type]:return False
+            except GatewayError as error:
+                if error.status!=404:return False
+            inventory=_Inventory(gateway,node.region);inventory.complete()
+            if any(row['id']==node.key for row in inventory.rows[node.resource_type]):return False
+            if inventory.consumers(node.key):return False
+            return True
+        except Exception:return False
 
     def submit(self,gateway,node,observation,attempt_id):
         if observation.status!='present' or not observation.etag:raise CleanupError('Mutation requires eligible live observation and ETag')

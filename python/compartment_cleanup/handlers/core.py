@@ -8,6 +8,7 @@ from dataclasses import replace
 
 from .base import Handler
 from ..model import CleanupError, Node, Edge, Observation, Probe, Submission
+from ..gateway import GatewayError
 
 
 _POLICY = {'Policy': ('identity', 'list_policies', 'get_policy', 'delete_policy', 'policy_id')}
@@ -220,6 +221,34 @@ class BlockBootVolumes(_TypedHandler):
     retained_reference_fields = ('kms_key_id',)
     terminal = {kind:'TERMINATED' for kind in _VOLUMES}
     eligible = {kind:('AVAILABLE',) for kind in _VOLUMES}
+
+    def corroborate_bulk_absence(self,gateway,node,scope):
+        """Only a caller's exact positive bulk DELETED evidence enables this path.
+
+        Complete typed regional inventories corroborate that event; absence by
+        itself is never positive deletion evidence. Scan visible tenancy links
+        so live ownership movement cannot be hidden by a scoped inventory.
+        """
+        try:
+            if node.resource_type not in _VOLUMES or node.compartment_id not in scope:
+                return False
+            try:
+                live,_=_read(gateway,node.region,node.resource_type,node.key)
+                if live['compartment_id']!=node.compartment_id or live.get('lifecycle_state')!=self.terminal[node.resource_type]:return False
+            except GatewayError as error:
+                if error.status!=404:return False
+            if node.resource_type in ('Volume','BootVolume') and self._connections(gateway,node,scope):return False
+            service,listing,_,_,_=_VOLUMES[node.resource_type]
+            seen=set()
+            for compartment in _compartments(gateway):
+                for row in gateway.items(service,node.region,listing,{'compartment_id':compartment}):
+                    _identity(row,owner=compartment)
+                    if row['id'] in seen:raise CleanupError('Conflicting typed inventory')
+                    seen.add(row['id'])
+                    if row['id']==node.key and (row['compartment_id']!=node.compartment_id or row.get('lifecycle_state')!=self.terminal[node.resource_type]):
+                        return False
+            return True
+        except Exception:return False
 
     def _guards(self,row):
         if any(row.get(field) for field in ('volume_group_id','volume_group_backup_id',

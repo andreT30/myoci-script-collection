@@ -381,7 +381,7 @@ class Storage(Handler):
             return key
         except Exception:return None
 
-    def submit_group(self,gateway,nodes,scope,attempt_id):
+    def submit_group(self,gateway,nodes,scope,attempt_id,*,before_write=None):
         if self.batch_group(gateway,nodes,scope) is None:raise CleanupError('Storage batch is ineligible')
         identifiers=[];observations={}
         for node in nodes:
@@ -390,10 +390,12 @@ class Storage(Handler):
             observations[node.key]=observed
             identifiers.append(oci.object_storage.models.BatchDeleteObjectIdentifier(object_name=node.metadata['object_name'],if_match=observed.etag))
         first=nodes[0]
-        data,_=gateway.write(S,first.region,'batch_delete_objects',{
+        params={
             'namespace_name':first.metadata['namespace'],'bucket_name':first.metadata['bucket_name'],
             'batch_delete_objects_details':oci.object_storage.models.BatchDeleteObjectsDetails(objects=identifiers,is_skip_deleted_result=False),
-            'opc_client_request_id':_text(attempt_id)})
+            'opc_client_request_id':_text(attempt_id)}
+        if before_write is not None:before_write(params)
+        data,_=gateway.write(S,first.region,'batch_delete_objects',params)
         results={n.key:Submission('unresolved',None,None,'Batch item completion is unresolved; reconcile without replay') for n in nodes}
         try:
             if not isinstance(data,dict) or not isinstance(data.get('deleted'),list) or not isinstance(data.get('failed'),list):return results
