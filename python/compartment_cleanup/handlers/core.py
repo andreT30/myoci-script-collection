@@ -32,9 +32,9 @@ _FIELDS = {
     'VnicAttachment': ('instance_id', 'vnic_id', 'availability_domain'),
     'VolumeAttachment': ('instance_id', 'volume_id', 'attachment_type', 'availability_domain'),
     'BootVolumeAttachment': ('instance_id', 'boot_volume_id', 'availability_domain'),
-    'Vnic': ('subnet_id', 'vlan_id', 'nsg_ids', 'route_table_id', 'ipv6_addresses'),
-    'PrivateIp': ('vnic_id', 'subnet_id', 'vlan_id', 'route_table_id', 'lifetime', 'ip_state'),
-    'PublicIp': ('private_ip_id', 'assigned_entity_id', 'assigned_entity_type', 'lifetime', 'scope', 'availability_domain'),
+    'Vnic': ('subnet_id', 'vlan_id', 'nsg_ids', 'route_table_id', 'ipv6_addresses', 'private_ip', 'public_ip'),
+    'PrivateIp': ('vnic_id', 'subnet_id', 'vlan_id', 'route_table_id', 'lifetime', 'ip_state', 'ip_address', 'is_primary'),
+    'PublicIp': ('private_ip_id', 'assigned_entity_id', 'assigned_entity_type', 'lifetime', 'scope', 'availability_domain', 'ip_address'),
 }
 _VOLUME_FIELDS = ('kms_key_id', 'volume_group_id', 'volume_group_backup_id',
                   'block_volume_replicas', 'boot_volume_replicas',
@@ -360,6 +360,7 @@ class ComputeInstances(_TypedHandler):
                     targets=vnic.get(field) or []
                     targets=targets if isinstance(targets,list) else [targets]
                     edges.extend(Edge(node.key,target,'Typed VNIC '+field) for target in targets)
+                primary_private_ips,primary_public_ips=[],[]
                 for summary_ip in gateway.items('network',node.region,'list_private_ips',{'vnic_id':vnic['id']}):
                     ip,_=_read(gateway,node.region,'PrivateIp',summary_ip['id'])
                     _identity(ip,summary_ip['id'],summary_ip['compartment_id'])
@@ -369,6 +370,10 @@ class ComputeInstances(_TypedHandler):
                         raise CleanupError('Private IP cascade scope is unresolved')
                     if _metadata('PrivateIp',ip)!=_metadata('PrivateIp',summary_ip):
                         raise CleanupError('Private IP dependency changed')
+                    if not isinstance(ip.get('ip_address'),str) or not ip['ip_address'] or type(ip.get('is_primary')) is not bool:
+                        raise CleanupError('Private IP address or primary membership is unresolved')
+                    if ip['is_primary']:
+                        primary_private_ips.append(ip)
                     children.append(_node('PrivateIp',ip,node.region,self))
                     if ip.get('route_table_id'):
                         edges.append(Edge(node.key,ip['route_table_id'],'Typed private IP route table'))
@@ -379,17 +384,35 @@ class ComputeInstances(_TypedHandler):
                         _identity(pub,summary_public['id'],summary_public['compartment_id'])
                         if _metadata('PublicIp',pub)!=_metadata('PublicIp',summary_public):
                             raise CleanupError('Public IP association changed')
-                        if pub.get('assigned_entity_type') not in (None,'PRIVATE_IP'):
+                        associations=[pub.get(field) for field in ('private_ip_id','assigned_entity_id') if pub.get(field)]
+                        if not associations or any(identity!=ip['id'] for identity in associations):
+                            raise CleanupError('Public IP private association IDs conflict')
+                        if (pub.get('assigned_entity_type') not in (None,'PRIVATE_IP')
+                                or (pub.get('assigned_entity_id') and pub.get('assigned_entity_type')!='PRIVATE_IP')):
                             raise CleanupError('Public IP assigned entity is unsupported')
+                        if not isinstance(pub.get('ip_address'),str) or not pub['ip_address']:
+                            raise CleanupError('Public IP address is unresolved')
+                        if ip['is_primary']:
+                            primary_public_ips.append(pub)
                         if pub['lifetime']=='RESERVED':
                             if pub.get('lifecycle_state')!='ASSIGNED':
                                 raise CleanupError('Reserved public IP association is transitional')
                             retained_public_ips.append({field:pub.get(field) for field in
-                                ('id','compartment_id','private_ip_id','assigned_entity_id','lifetime')})
+                                ('id','compartment_id','private_ip_id','assigned_entity_id','lifetime','ip_address')})
                             continue  # Preserved resource; automatic unassignment is disclosed.
                         if pub['compartment_id'] not in scope or pub.get('lifecycle_state')!='ASSIGNED':
                             raise CleanupError('Ephemeral public IP cascade is external or unresolved')
                         children.append(_node('PublicIp',pub,node.region,self))
+                # The VNIC's primary address provides independent evidence that
+                # complete association lists actually contain its primary IP.
+                if (len(primary_private_ips)!=1 or not vnic.get('private_ip')
+                        or primary_private_ips[0]['ip_address']!=vnic['private_ip']):
+                    raise CleanupError('VNIC primary private IP is missing or contradicts inventory')
+                if vnic.get('public_ip'):
+                    if len(primary_public_ips)!=1 or primary_public_ips[0]['ip_address']!=vnic['public_ip']:
+                        raise CleanupError('VNIC primary public IP is missing or contradicts inventory')
+                elif primary_public_ips:
+                    raise CleanupError('Public IP inventory contradicts the VNIC primary address')
             else:
                 if kind=='VolumeAttachment' and row.get('attachment_type') not in ('iscsi','paravirtualized'):
                     raise CleanupError('Unsupported attachment subtype')

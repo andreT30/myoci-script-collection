@@ -242,10 +242,10 @@ class CoreTests(unittest.TestCase):
     def test_live_cascade_includes_scoped_vnic_private_and_ephemeral_public_ips(self):
         self.g.add_row(resource('i','Instance',state='RUNNING'),'list_instances')
         self.g.add_row(resource('a','VnicAttachment',state='ATTACHED',metadata={'instance_id':'i','vnic_id':'nic'}),'list_vnic_attachments')
-        self.g.add(resource('nic','Vnic',C,'AVAILABLE',{'subnet_id':'subnet','nsg_ids':[]}))
-        self.g.add_row(resource('ip','PrivateIp',C,'',{'vnic_id':'nic','subnet_id':'subnet','lifetime':'EPHEMERAL','ip_state':'ASSIGNED'}),'list_private_ips')
+        self.g.add(resource('nic','Vnic',C,'AVAILABLE',{'subnet_id':'subnet','nsg_ids':[],'private_ip':'10.0.0.2','public_ip':'203.0.113.2'}))
+        self.g.add_row(resource('ip','PrivateIp',C,'',{'vnic_id':'nic','subnet_id':'subnet','lifetime':'EPHEMERAL','ip_state':'ASSIGNED','ip_address':'10.0.0.2','is_primary':True}),'list_private_ips')
         self.g.add_row(resource('pub','PublicIp',C,'ASSIGNED',{'private_ip_id':'ip','assigned_entity_id':'ip',
-            'assigned_entity_type':'PRIVATE_IP','lifetime':'EPHEMERAL','scope':'AVAILABILITY_DOMAIN','availability_domain':'AD-one'}),'list_public_ips')
+            'ip_address':'203.0.113.2','assigned_entity_type':'PRIVATE_IP','lifetime':'EPHEMERAL','scope':'AVAILABILITY_DOMAIN','availability_domain':'AD-one'}),'list_public_ips')
         nodes,edges,_=self.compute.discover(self.g,P,R)
         by_id={n.key:n for n in nodes}
         self.assertEqual(set(by_id),{'i','a','nic','ip','pub'})
@@ -293,10 +293,10 @@ class CoreTests(unittest.TestCase):
     def test_reserved_public_ip_is_retained_and_external_ephemeral_blocks(self):
         self.g.add_row(resource('i','Instance',state='RUNNING'),'list_instances')
         self.g.add_row(resource('a','VnicAttachment',state='ATTACHED',metadata={'instance_id':'i','vnic_id':'nic'}),'list_vnic_attachments')
-        self.g.add(resource('nic','Vnic',state='AVAILABLE',metadata={'subnet_id':'subnet'}))
-        self.g.add_row(resource('ip','PrivateIp',P,'',{'vnic_id':'nic','subnet_id':'subnet','lifetime':'EPHEMERAL','ip_state':'ASSIGNED'}),'list_private_ips')
+        self.g.add(resource('nic','Vnic',state='AVAILABLE',metadata={'subnet_id':'subnet','private_ip':'10.0.0.2','public_ip':'203.0.113.2'}))
+        self.g.add_row(resource('ip','PrivateIp',P,'',{'vnic_id':'nic','subnet_id':'subnet','lifetime':'EPHEMERAL','ip_state':'ASSIGNED','ip_address':'10.0.0.2','is_primary':True}),'list_private_ips')
         self.g.add_row(resource('pub','PublicIp',X,'ASSIGNED',{'private_ip_id':'ip','assigned_entity_id':'ip',
-            'assigned_entity_type':'PRIVATE_IP','lifetime':'RESERVED','scope':'REGION'}),'list_public_ips')
+            'ip_address':'203.0.113.2','assigned_entity_type':'PRIVATE_IP','lifetime':'RESERVED','scope':'REGION'}),'list_public_ips')
         nodes,_,_=self.compute.discover(self.g,P,R)
         self.assertNotIn('pub',{n.key for n in nodes})
         instance=next(n for n in nodes if n.key=='i')
@@ -365,6 +365,69 @@ class CoreTests(unittest.TestCase):
             'lifecycle_state':'DELETED','nodes':[{'id':'i','node_pool_id':'pool','lifecycle_state':'DELETED'}]}, {})
         nodes,_,_=self.compute.discover(self.g,P,R)
         self.assertTrue(next(n for n in nodes if n.key=='i').blockers)
+
+    def addressed_instance(self):
+        self.g.add_row(resource('i','Instance',state='RUNNING'),'list_instances')
+        self.g.add_row(resource('a','VnicAttachment',state='ATTACHED',metadata={'instance_id':'i','vnic_id':'nic'}),'list_vnic_attachments')
+        self.g.add(resource('nic','Vnic',state='AVAILABLE',metadata=oci.util.to_dict(oci.core.models.Vnic(
+            subnet_id='subnet',private_ip='10.0.0.2',public_ip='203.0.113.2'))))
+        self.g.add_row(resource('ip','PrivateIp',P,'',oci.util.to_dict(oci.core.models.PrivateIp(
+            vnic_id='nic',subnet_id='subnet',lifetime='EPHEMERAL',ip_state='ASSIGNED',
+            ip_address='10.0.0.2',is_primary=True))),'list_private_ips')
+        self.g.add_row(resource('pub','PublicIp',P,'ASSIGNED',oci.util.to_dict(oci.core.models.PublicIp(
+            private_ip_id='ip',assigned_entity_id='ip',assigned_entity_type='PRIVATE_IP',ip_address='203.0.113.2',
+            lifetime='EPHEMERAL',scope='AVAILABILITY_DOMAIN',availability_domain='AD-one'))),'list_public_ips')
+
+    def test_vnic_addresses_require_reciprocal_private_and_public_inventory(self):
+        self.addressed_instance()
+        self.g.rows['list_private_ips']=[]
+        self.g.rows['list_public_ips']=[]
+        nodes,_,_=self.compute.discover(self.g,P,R)
+        self.assertTrue(next(n for n in nodes if n.key=='i').blockers)
+        self.assertFalse(any(n.metadata.get('cascade_verified') for n in nodes))
+
+    def test_primary_private_ip_address_or_primary_flag_mismatch_blocks(self):
+        for change in ({'ip_address':'10.0.0.3'},{'is_primary':False}):
+            with self.subTest(change=change):
+                self.g=CoreGateway()
+                self.addressed_instance()
+                self.g.resources['ip']=replace(self.g.resources['ip'],metadata=dict(self.g.resources['ip'].metadata,**change))
+                self.g.rows['list_private_ips'][0].update(change)
+                nodes,_,_=self.compute.discover(self.g,P,R)
+                self.assertTrue(next(n for n in nodes if n.key=='i').blockers)
+
+    def test_primary_public_ip_requires_exact_address_and_matching_association_ids(self):
+        for change in ({'assigned_entity_id':'different-private-ip'},{'ip_address':'203.0.113.3'}):
+            with self.subTest(change=change):
+                self.g=CoreGateway()
+                self.addressed_instance()
+                self.g.resources['pub']=replace(self.g.resources['pub'],metadata=dict(self.g.resources['pub'].metadata,**change))
+                self.g.rows['list_public_ips'][0].update(change)
+                nodes,_,_=self.compute.discover(self.g,P,R)
+                self.assertTrue(next(n for n in nodes if n.key=='i').blockers)
+        self.g=CoreGateway()
+        self.addressed_instance()
+        self.g.rows['list_public_ips']=[]
+        self.assertTrue(next(n for n in self.compute.discover(self.g,P,R)[0] if n.key=='i').blockers)
+
+    def test_address_and_primary_membership_drift_blocks_submission(self):
+        self.addressed_instance()
+        nodes,_,_=self.compute.discover(self.g,P,R)
+        n=next(n for n in nodes if n.key=='i')
+        self.assertFalse(n.blockers)
+        observation=self.compute.inspect(self.g,n,{P,C})
+        self.assertEqual(observation.status,'present')
+        # Change every live endpoint consistently, keeping the exact same child IDs.
+        self.g.resources['nic']=replace(self.g.resources['nic'],metadata=dict(self.g.resources['nic'].metadata,
+            private_ip='10.0.0.3',public_ip='203.0.113.3'))
+        self.g.resources['ip']=replace(self.g.resources['ip'],metadata=dict(self.g.resources['ip'].metadata,ip_address='10.0.0.3'))
+        self.g.rows['list_private_ips'][0]['ip_address']='10.0.0.3'
+        self.g.resources['pub']=replace(self.g.resources['pub'],metadata=dict(self.g.resources['pub'].metadata,ip_address='203.0.113.3'))
+        self.g.rows['list_public_ips'][0]['ip_address']='203.0.113.3'
+        self.assertEqual(self.compute.inspect(self.g,n,{P,C}).status,'unresolved')
+        with self.assertRaises(CleanupError):
+            self.compute.submit(self.g,n,observation,'attempt')
+        self.assertFalse(any(event[0]=='write' for event in self.g.events))
 
     def test_terminal_states_are_type_specific(self):
         for kind,state,handler,want in [('Volume','TERMINATED',self.volumes,'deleted'),
