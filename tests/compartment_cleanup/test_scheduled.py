@@ -27,6 +27,7 @@ class ScheduledGateway:
         self.rows={}; self.extra={}; self.events=[]; self.lost=False
         self.confirmed='2026-10-20T12:34:56Z'
     def add(self,kind,key,owner=P,region=R,**fields):
+        if kind=='CertificateAuthority': fields.setdefault('config_type','ROOT_CA_GENERATED_INTERNALLY')
         row=dict(id=key,compartment_id=owner,lifecycle_state='ENABLED' if kind=='Key' else 'ACTIVE',**fields)
         self.rows[(region,kind,key)]=row
         return row
@@ -359,7 +360,7 @@ class ScheduledTests(unittest.TestCase):
         n=self.cert(); row=self.g.rows[(R,'Certificate','cert')]
         row.update(lifecycle_state='SCHEDULING_DELETION',time_of_deletion=None)
         record=self.h.reconcile_record(self.g,n,{P},{'attempts':[{'id':'lost'}]})
-        self.assertEqual(record['status'],'pending'); self.assertNotIn('scheduled_at',record)
+        self.assertEqual(record['status'],'pending'); self.assertIsNone(record['scheduled_at'])
         row.update(lifecycle_state='PENDING_DELETION',time_of_deletion='2026-10-20T12:34:56+00:00')
         self.assertEqual(self.h.inspect(self.g,n,{P}).scheduled_at,'2026-10-20T12:34:56+00:00')
 
@@ -392,3 +393,80 @@ class ScheduledTests(unittest.TestCase):
         refreshed=self.h.refresh_node(self.g,fresh,old,{P,C})
         self.assertTrue(refreshed.metadata['key_consumers'])
         self.assertEqual(self.h.inspect(self.g,refreshed,{P,C}).status,'unresolved')
+    def test_deleted_foreign_secret_source_retains_live_replica_target_key_dependency(self):
+        v=self.vault(); k=self.key(); self.g.extra['get_vault_usage']={'key_count':1,'software_key_count':0}
+        source=self.g.add('Secret','foreign',owner=X,region='other',vault_id='sourcev',key_id='sourcek',is_replica=False,
+                          replication_config={'replication_targets':[{'target_region':R,'target_vault_id':'vault','target_key_id':'key'}]})
+        source['lifecycle_state']='DELETED'
+        replica=self.g.add('Secret','foreign',is_replica=True,vault_id='sourcev',key_id='sourcek',
+                           source_region_information={'source_region':'other','source_vault_id':'sourcev','source_key_id':'sourcek'})
+        self.assertEqual(self.h.inspect(self.g,k,{P,C}).status,'unresolved')
+        self.assertEqual(self.h.inspect(self.g,v,{P,C}).status,'unresolved')
+        replica['lifecycle_state']='DELETED'
+        self.assertEqual(self.h.inspect(self.g,k,{P,C}).status,'present')
+        self.assertEqual(self.h.inspect(self.g,v,{P,C}).status,'present')
+    def test_historical_replica_target_key_proof_survives_deleted_source_config_removal(self):
+        self.replicated_secret(); self.g.extra['get_vault_usage']={'key_count':1,'software_key_count':0}
+        nodes,_,_=self.h.discover(self.g,P,'other'); target=next(x for x in nodes if x.key=='targetk')
+        self.g.rows[(R,'Secret','secret')].update(lifecycle_state='DELETED',replication_config=None)
+        self.assertEqual(self.h.inspect(self.g,target,{P,C}).status,'unresolved')
+        self.g.rows[('other','Secret','secret')]['lifecycle_state']='DELETED'
+        self.assertEqual(self.h.inspect(self.g,target,{P,C}).status,'present')
+    def test_unreadable_replica_target_never_releases_key(self):
+        self.vault(); k=self.key()
+        self.g.add('Secret','foreign',owner=X,region='other',vault_id='sourcev',key_id='sourcek',is_replica=False,
+                   replication_config={'replication_targets':[{'target_region':R,'target_vault_id':'vault','target_key_id':'key'}]})['lifecycle_state']='DELETED'
+        self.assertEqual(self.h.inspect(self.g,k,{P,C}).status,'unresolved')
+
+    def test_leaf_certificate_present_crl_blocks_and_omits_raw_configuration(self):
+        crl=oci.certificates_management.models.CertificateRevocationListDetails(object_storage_config=oci.certificates_management.models.ObjectStorageBucketConfigDetails(object_storage_namespace='external',object_storage_bucket_name='external-bucket',object_storage_object_name_format='secret-sentinel'))
+        for config in (oci.util.to_dict(crl),{},'malformed'):
+            with self.subTest(config=config):
+                n=self.cert(certificate_revocation_list_details=config)
+                self.assertEqual(self.h.inspect(self.g,n,{P,C}).status,'unresolved')
+                nodes,_,_=self.h.discover(self.g,P,R); leaf=next(x for x in nodes if x.key=='cert')
+                self.assertTrue(leaf.blockers); self.assertTrue(leaf.metadata['has_crl_details'])
+                self.assertNotIn('secret-sentinel',json.dumps(leaf.metadata))
+    def test_current_pending_unknown_date_moves_old_confirmation_to_history(self):
+        n=self.cert(); self.g.rows[(R,'Certificate','cert')].update(lifecycle_state='PENDING_DELETION',time_of_deletion=None)
+        old={'status':'pending','scheduled_at':'2020-01-01T00:00:00Z','attempts':[{'id':'original'}]}
+        record=self.h.reconcile_record(self.g,n,{P,C},old)
+        self.assertIsNone(record.get('scheduled_at'))
+        self.assertEqual(record['attempts'],[{'id':'original'}])
+        self.assertEqual(record['schedule_history'][0]['scheduled_at'],'2020-01-01T00:00:00Z')
+        stale=replace(n,lifecycle_state='PENDING_DELETION',metadata={'scheduled_at':'2020-01-01T00:00:00Z'})
+        report=render_report(self.plan([stale]),State(1,T,P,{'cert':record}))
+        self.assertIn('unknown UTC schedule',report); self.assertNotIn('pending deletion until 2020',report)
+        self.assertEqual(old['scheduled_at'],'2020-01-01T00:00:00Z')
+    def test_ca_unknown_or_malformed_configuration_type_cannot_schedule(self):
+        for kind in ('UNKNOWN_ENUM_VALUE','FUTURE_CA',None,{},''):
+            with self.subTest(kind=kind):
+                self.g.add('CertificateAuthority','ca',config_type=kind)
+                self.assertEqual(self.h.inspect(self.g,node('CertificateAuthority','ca'),{P,C}).status,'unresolved')
+                nodes,_,_=self.h.discover(self.g,P,R); self.assertTrue(next(x for x in nodes if x.key=='ca').blockers)
+        for kind in ('ROOT_CA_GENERATED_INTERNALLY','SUBORDINATE_CA_ISSUED_BY_INTERNAL_CA','ROOT_CA_MANAGED_EXTERNALLY','SUBORDINATE_CA_MANAGED_INTERNALLY_ISSUED_BY_EXTERNAL_CA'):
+            self.g.add('CertificateAuthority','ca',config_type=kind)
+            self.assertEqual(self.h.inspect(self.g,node('CertificateAuthority','ca'),{P,C}).status,'present')
+    def test_foreign_replica_target_history_survives_source_config_and_list_omission(self):
+        self.vault(); self.key(); self.g.extra['get_vault_usage']={'key_count':1,'software_key_count':0}
+        source=self.g.add('Secret','foreign',owner=X,region='other',vault_id='sourcev',key_id='sourcek',is_replica=False,
+                          replication_config={'replication_targets':[{'target_region':R,'target_vault_id':'vault','target_key_id':'key'}]})
+        self.g.add('Secret','foreign',is_replica=True,vault_id='sourcev',key_id='sourcek',
+                   source_region_information={'source_region':'other','source_vault_id':'sourcev','source_key_id':'sourcek'})
+        nodes,_,_=self.h.discover(self.g,P,R); k=next(x for x in nodes if x.key=='key'); v=next(x for x in nodes if x.key=='vault')
+        self.assertTrue(k.metadata.get('key_consumers')); self.assertTrue(v.metadata.get('key_consumers'))
+        source.update(lifecycle_state='DELETED',replication_config=None); self.g.extra['list_secrets']=[]
+        self.assertEqual(self.h.inspect(self.g,k,{P,C}).status,'unresolved')
+        self.assertEqual(self.h.inspect(self.g,v,{P,C}).status,'unresolved')
+    def test_denied_regional_replica_read_holds_individual_key_and_vault(self):
+        self.replicated_secret(); self.g.extra['get_vault_usage']={'key_count':1,'software_key_count':0}
+        nodes,_,_=self.h.discover(self.g,P,'other')
+        key=next(x for x in nodes if x.key=='targetk'); vault=next(x for x in nodes if x.key=='targetv')
+        self.g.rows[(R,'Secret','secret')]['lifecycle_state']='DELETED'
+        original=self.g.read
+        def denied(service,region,operation,params,endpoint=None):
+            if region=='other' and operation=='get_secret': raise CleanupError('Denied regional replica read')
+            return original(service,region,operation,params,endpoint)
+        self.g.read=denied
+        self.assertEqual(self.h.inspect(self.g,key,{P,C}).status,'unresolved')
+        self.assertEqual(self.h.inspect(self.g,vault,{P,C}).status,'unresolved')

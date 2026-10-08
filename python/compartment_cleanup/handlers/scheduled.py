@@ -22,8 +22,8 @@ _CONTRACTS = {
     'Secret': ('vault','list_secrets','get_secret','schedule_secret_deletion','secret_id','schedule_secret_deletion_details',oci.vault.models.ScheduleSecretDeletionDetails),
 }
 _FIELDS = {
-    'Certificate': ('issuer_certificate_authority_id',),
-    'CertificateAuthority': ('issuer_certificate_authority_id','kms_key_id','certificate_revocation_list_details'),
+    'Certificate': ('issuer_certificate_authority_id','certificate_revocation_list_details'),
+    'CertificateAuthority': ('issuer_certificate_authority_id','kms_key_id','certificate_revocation_list_details','config_type'),
     'CaBundle': (),
     'Vault': ('vault_type','is_primary','replica_details'),
     'Key': ('vault_id','protection_mode','is_primary','replica_details'),
@@ -93,7 +93,7 @@ class ScheduledResources(Handler):
         metadata={k:v for k,v in node.metadata.items() if k in allowed}
         # Nested regional evidence is identifying data only, never arbitrary SDK
         # fields, tags or content from a saved artifact. Execution renews it live.
-        for field,keys in (('key_consumers',('id','kind','region','compartment_id','key_id','namespace','bucket_name','reference')),
+        for field,keys in (('key_consumers',('id','kind','region','compartment_id','key_id','namespace','bucket_name','reference','target_region','target_vault_id','target_key_id','source_vault_id','source_key_id','replica_compartment_id','target_vault_compartment_id','target_key_compartment_id')),
                            ('replication_targets',('target_region','target_vault_id','target_key_id')),
                            ('regional_replicas',('id','region','compartment_id','lifecycle_state','source_region','source_vault_id','source_key_id','target_region','target_vault_id','target_key_id','scheduled_at'))):
             if field in metadata:
@@ -155,10 +155,14 @@ class ScheduledResources(Handler):
         for field,mode in (('key_count','HSM'),('software_key_count','SOFTWARE')):
             count=usage.get(field)
             if type(count) is not int or count<0 or count!=counts[mode]: raise CleanupError('Vault usage count does not prove complete key identity set')
-        consumers=self._key_consumers(gateway,set(keys),scope,previous)
+        consumers=self._key_consumers(gateway,set(keys),scope,previous,record_external=allow_references)
         if consumers and not allow_references: raise CleanupError('Live vault key consumers remain')
         for key in keys.values(): key['__key_consumers']=[c for c in consumers if c['key_id']==key['id']]
         return keys
+
+    def _outside_consumers(self,consumers,scope):
+        return any(c.get(field) is not None and c[field] not in scope for c in consumers
+                   for field in ('compartment_id','replica_compartment_id','target_vault_compartment_id','target_key_compartment_id'))
 
     def _consumer_read(self,gateway,ref):
         kind=ref['kind']; region=ref['region']
@@ -185,11 +189,41 @@ class ScheduledResources(Handler):
         if key is not None:
             if not isinstance(key,str) or not key: raise CleanupError('Malformed typed key reference')
             result.append((key,field))
-        if kind=='Secret':
-            for target in self._targets(row): result.append((target['target_key_id'],'replication_target'))
         return result
 
-    def _key_consumers(self,gateway,key_ids,scope,previous=()):
+    def _target_key_consumers(self,gateway,ref,source,key_ids,scope,previous,record_external=False):
+        if source.get('is_replica') is not False: raise CleanupError('Secret source role unresolved')
+        targets=self._targets(source)
+        for old in previous:
+            if old.get('kind')=='Secret' and old.get('region')==ref['region'] and old.get('id')==ref['id'] and old.get('reference')=='replication_target':
+                target={k:old.get(k) for k in ('target_region','target_vault_id','target_key_id')}
+                if any(not isinstance(v,str) or not v for v in target.values()): raise CleanupError('Historical target key evidence malformed')
+                if target not in targets: targets.append(target)
+        consumers=[]
+        for target in targets:
+            if target['target_key_id'] not in key_ids: continue
+            region=target['target_region']
+            if region not in gateway.regions or region==ref['region']: raise CleanupError('Target key region unresolved')
+            replica,_=gateway.read('vault',region,'get_secret',{'secret_id':ref['id']}); _identity(replica,ref['id'])
+            expected={'source_region':ref['region'],'source_vault_id':source.get('vault_id'),'source_key_id':source.get('key_id')}
+            if any(not isinstance(v,str) or not v for v in expected.values()): raise CleanupError('Secret source linkage malformed')
+            info=replica.get('source_region_information')
+            if replica.get('is_replica') is not True or type(info) is not dict or any(info.get(k)!=v for k,v in expected.items()):
+                raise CleanupError('Replica target key linkage unresolved')
+            # A source DELETED observation does not establish asynchronous regional
+            # deletion. Only the exact regional replica's positive state releases it.
+            if replica.get('lifecycle_state')=='DELETED': continue
+            if replica.get('lifecycle_state') not in _ELIGIBLE['Secret']+_PENDING: raise CleanupError('Target replica lifecycle unresolved')
+            if not record_external and (source['compartment_id'] not in scope or replica['compartment_id'] not in scope): raise CleanupError('External regional secret key consumer')
+            vault,_=self._vault(gateway,region,target['target_vault_id'])
+            key,_=gateway.read('kms_management',region,'get_key',{'key_id':target['target_key_id']},endpoint=vault['management_endpoint']); _identity(key,target['target_key_id'])
+            if key.get('vault_id')!=vault['id'] or (not record_external and (key['compartment_id'] not in scope or vault['compartment_id'] not in scope)): raise CleanupError('Replica target encryption scope unresolved')
+            consumers.append(dict(ref,compartment_id=source['compartment_id'],key_id=target['target_key_id'],reference='replication_target',
+                                  source_vault_id=source['vault_id'],source_key_id=source['key_id'],replica_compartment_id=replica['compartment_id'],
+                                  target_vault_compartment_id=vault['compartment_id'],target_key_compartment_id=key['compartment_id'],**target))
+        return targets,consumers
+
+    def _key_consumers(self,gateway,key_ids,scope,previous=(),record_external=False):
         """Supported reverse consumers only; OCI exposes no universal key index.
 
         Scan every readable tenancy compartment and subscribed region. Failed
@@ -231,10 +265,24 @@ class ScheduledResources(Handler):
         consumers=[]
         for ref,row in known.values():
             terminal='TERMINATED' if ref['kind'] in ('Volume','BootVolume','VolumeBackup','BootVolumeBackup') else 'DELETED'
+            if ref['kind']=='Secret':
+                if row.get('is_replica') is False:
+                    _,regional=self._target_key_consumers(gateway,ref,row,key_ids,scope,previous,record_external)
+                elif row.get('is_replica') is True and row.get('lifecycle_state')!='DELETED':
+                    info=row.get('source_region_information')
+                    if type(info) is not dict or info.get('source_region') not in gateway.regions: raise CleanupError('Regional secret source identity unresolved')
+                    source_ref=dict(ref,region=info['source_region'])
+                    source=self._consumer_read(gateway,source_ref)
+                    targets,regional=self._target_key_consumers(gateway,source_ref,source,key_ids,scope,previous,record_external)
+                    if not any(t['target_region']==ref['region'] for t in targets): raise CleanupError('Live replica encryption target identity is unavailable')
+                elif row.get('is_replica') is True: regional=[]
+                else: raise CleanupError('Secret reverse consumer role unresolved')
+                for evidence in regional:
+                    if evidence not in consumers: consumers.append(evidence)
             if row.get('lifecycle_state')==terminal: continue
             for key,field in self._consumer_keys(ref['kind'],row):
                 if key not in key_ids: continue
-                if row['compartment_id'] not in scope: raise CleanupError('External typed key consumer blocks deletion')
+                if not record_external and row['compartment_id'] not in scope: raise CleanupError('External typed key consumer blocks deletion')
                 evidence=dict(ref,compartment_id=row['compartment_id'],key_id=key,reference=field)
                 if evidence not in consumers: consumers.append(evidence)
         return sorted(consumers,key=lambda x:(x['key_id'],x['region'],x['kind'],x['id'],x['reference']))
@@ -340,7 +388,9 @@ class ScheduledResources(Handler):
         if kind in ('Certificate','CertificateAuthority','CaBundle'):
             consumers=self._consumers(gateway,node,scope)
             issued=self._issued(gateway,node,scope) if kind=='CertificateAuthority' else []
-            if kind=='CertificateAuthority' and row.get('certificate_revocation_list_details') is not None:
+            if kind=='CertificateAuthority' and row.get('config_type') not in ('ROOT_CA_GENERATED_INTERNALLY','SUBORDINATE_CA_ISSUED_BY_INTERNAL_CA','ROOT_CA_MANAGED_EXTERNALLY','SUBORDINATE_CA_MANAGED_INTERNALLY_ISSUED_BY_EXTERNAL_CA'):
+                raise CleanupError('Certificate authority configuration type unresolved')
+            if kind in ('Certificate','CertificateAuthority') and row.get('certificate_revocation_list_details') is not None:
                 raise CleanupError('CRL object deletion effects are unproven')
             if not allow_references and (consumers or issued): raise CleanupError('Certificate consumers or issued children remain')
             return [Edge(x,node.key,'Typed certificate consumer') for x in consumers]+[Edge(x,node.key,'Typed issuer relationship') for x in issued]
@@ -351,7 +401,7 @@ class ScheduledResources(Handler):
         if kind=='Key':
             vault,_=self._vault(gateway,node.region,row['vault_id']); self._unreplicated(gateway,node.region,vault,row)
             if vault.get('lifecycle_state')!='ACTIVE': raise CleanupError('Vault deletion or transition is already pending')
-            consumers=self._key_consumers(gateway,{node.key},scope,node.metadata.get('key_consumers',[]))
+            consumers=self._key_consumers(gateway,{node.key},scope,node.metadata.get('key_consumers',[]),record_external=allow_references)
             if consumers and not allow_references: raise CleanupError('Live key consumers remain')
             return consumers
         if kind=='Secret': return self._secret_group(gateway,node,row,scope)
@@ -460,6 +510,7 @@ class ScheduledResources(Handler):
                         if owner in scope:
                             members=list(self._key_set(gateway,region,vault,scope,allow_references=True).values())
                             vault_node=replace(vault_node,metadata=dict(vault_node.metadata,cascade_members=sorted(x['id'] for x in members),cascade_verified=True,key_consumers=[c for x in members for c in x['__key_consumers']]))
+                            if self._outside_consumers(vault_node.metadata['key_consumers'],scope): vault_node=_blocked(vault_node,'External typed key consumer blocks vault cascade')
                     except Exception:
                         vault_node=_blocked(vault_node,'Vault cascade identity, count or replication proof unresolved')
                     if owner==compartment_id: nodes.append(self.classify(vault_node))
@@ -471,8 +522,9 @@ class ScheduledResources(Handler):
                         key_node=_node('Key',row,region,self)
                         try:
                             self._unreplicated(gateway,region,vault,row)
-                            consumers=self._key_consumers(gateway,{row['id']},scope)
+                            consumers=self._key_consumers(gateway,{row['id']},scope,record_external=True)
                             key_node=replace(key_node,metadata=dict(key_node.metadata,key_consumers=consumers))
+                            if self._outside_consumers(consumers,scope): key_node=_blocked(key_node,'External typed key consumer blocks deletion')
                             edges.extend(Edge(c['id'],row['id'],'Typed KMS consumer') for c in consumers)
                         except Exception: key_node=_blocked(key_node,'Key replication or reverse consumer identity unresolved')
                         if not vault_node.blockers and owner in scope and row['id'] in [x['id'] for x in members]:
@@ -511,6 +563,8 @@ class ScheduledResources(Handler):
             elif row.get('lifecycle_state')!='DELETED':
                 proof=self._dependencies(gateway,renewed,row,scope,allow_references=True)
                 metadata['key_consumers']=[c for key in proof.values() for c in key['__key_consumers']] if node.resource_type=='Vault' else proof
+            if node.resource_type in ('Key','Vault') and self._outside_consumers(metadata.get('key_consumers',[]),scope):
+                return _blocked(replace(renewed,metadata=metadata),'Historical external key consumer remains unresolved')
             return replace(renewed,metadata=metadata)
         except Exception:
             return _blocked(renewed,'Historical regional or reverse consumer evidence remains unresolved')
@@ -523,5 +577,15 @@ class ScheduledResources(Handler):
         """
         observation=self.inspect(gateway,node,scope)
         updated=dict(record,status=observation.status,lifecycle_state=observation.lifecycle_state)
-        if observation.scheduled_at is not None: updated['scheduled_at']=observation.scheduled_at
+        if observation.scheduled_at is not None:
+            updated['scheduled_at']=observation.scheduled_at
+        elif observation.status in ('present','pending','deleted'):
+            old=record.get('scheduled_at')
+            if old is not None:
+                history=record.get('schedule_history',[])
+                if type(history) is not list: raise CleanupError('Schedule history is malformed')
+                updated['schedule_history']=list(history)+[{'scheduled_at':old,'status':record.get('status','unknown'),'lifecycle_state':record.get('lifecycle_state','')} ]
+            # Explicit None is a successful current observation of an unknown
+            # schedule, distinct from an unresolved read that retains history.
+            updated['scheduled_at']=None
         return updated
