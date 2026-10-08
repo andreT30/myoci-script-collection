@@ -152,6 +152,7 @@ _OPERATIONS = {
     ("vault", "list_secrets"): ("read", lambda c, p: c.list_secrets(**p)),
     ("vault", "get_secret"): ("read", lambda c, p: c.get_secret(**p)),
     ("vault", "schedule_secret_deletion"): ("write", lambda c, p: c.schedule_secret_deletion(**p)),
+    ("log_analytics", "get_log_analytics_log_group"): ("read", lambda c, p: c.get_log_analytics_log_group(**p)),
     ("log_analytics", "list_namespaces"): ("read", lambda c, p: c.list_namespaces(**p)),
     ("log_analytics", "list_log_analytics_entities"): ("read", lambda c, p: c.list_log_analytics_entities(**p)),
     ("log_analytics", "get_log_analytics_entity"): ("read", lambda c, p: c.get_log_analytics_entity(**p)),
