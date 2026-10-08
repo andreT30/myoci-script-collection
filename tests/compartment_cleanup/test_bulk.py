@@ -247,6 +247,19 @@ class BulkTests(unittest.TestCase):
         self.state.records[key]['record_type']='fake'
         with self.assertRaises(CleanupError):resource_records(self.state)
 
+    def test_missing_or_duplicate_inverse_group_reference_cannot_authorize_another_write(self):
+        from compartment_cleanup.reporting import render_report
+        for damage in ('missing_reference','missing_record','duplicate_reference'):
+            with self.subTest(damage=damage):
+                self.setUp();self.submit()
+                if damage=='missing_record':del self.state.records['a']
+                elif damage=='missing_reference':self.state.records['a']['attempts']=[]
+                else:self.state.records['a']['attempts']*=2
+                with self.ws.locked():self.ws.save_state(self.state)
+                with self.assertRaises(CleanupError):self.submit(nodes=[self.nodes[0]],token='new-token')
+                with self.assertRaises(CleanupError):render_report(self.plan,self.state)
+                self.assertEqual(len(self.writes()),1)
+
     def test_report_shows_failed_bulk_outcome_and_configured_limits(self):
         from compartment_cleanup.reporting import render_report
         self.submit();self.wr('FAILED');self.inspect()

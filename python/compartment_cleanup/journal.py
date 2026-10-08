@@ -42,6 +42,7 @@ def resource_records(state):
         attempt=_group(key,record)
         if attempt is None:resources[key]=record
         else:groups[key]=(attempt['attempt_id'],set(attempt['node_keys']))
+    linked=set()
     for node_key,record in resources.items():
         history=record.get('attempts',[])
         if not isinstance(history,list):raise CleanupError('Malformed resource attempt history')
@@ -54,6 +55,12 @@ def resource_records(state):
             token,nodes=groups[key]
             if item['attempt_id']!=token or node_key not in nodes:
                 raise CleanupError('Bulk history reference does not match its resource group')
+            pair=(key,node_key)
+            if pair in linked:raise CleanupError('Duplicate inverse bulk group reference')
+            linked.add(pair)
+    for key,(_,nodes) in groups.items():
+        if any((key,node_key) not in linked for node_key in nodes):
+            raise CleanupError('Bulk group member lacks its exact resource history reference')
     return resources
 
 
