@@ -1,0 +1,2 @@
+# Validated with 2.187.0 and installed 2.187.2; major upgrades require contract review.
+oci>=2.187.0,<3
