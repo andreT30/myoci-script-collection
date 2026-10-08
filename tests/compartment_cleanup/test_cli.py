@@ -328,3 +328,83 @@ class CLITests(unittest.TestCase):
         self.assertTrue(state.records['disk']['proof_invalidations'])
         self.assertIn('disk', (self.path / 'report.txt').read_text())
         self.assertNotEqual(state.records['disk']['status'], 'deleted')
+
+    def test_report_retains_pending_iam_members_until_exact_group_completion(self):
+        from test_executor import IntegratedGateway
+        from compartment_cleanup.discovery import discover
+        from compartment_cleanup.executor import submit_bulk
+        from compartment_cleanup.store import reconcile_state
+        from compartment_cleanup.journal import bulk_attempt_records
+        self.g = IntegratedGateway()
+        self.factory.return_value = self.g
+        cli.build_registry.return_value = self.registry
+        self.g.catalog = [{'name': 'Volume', 'metadata_keys': []}]
+        original = Node('one', 'Volume', R, P, '', 'AVAILABLE', '', 'unresolved', {})
+        self.g.add(original)
+        workspace = Workspace(self.path)
+        plan = discover(self.g, P, self.registry)
+        state = reconcile_state(plan, None)
+        with workspace.locked():
+            workspace.save_plan(plan)
+            workspace.save_state(state)
+            result = submit_bulk(self.g, plan, [plan.nodes['one']], 'review-token',
+                                 registry=self.registry, workspace=workspace, state=state)
+        self.g.resources['one'] = replace(original, lifecycle_state='TERMINATED')
+        request = self.g.work_requests[result.request_id]
+        request['status'] = 'IN_PROGRESS'
+        self.assertEqual(self.run_cli(), 0)
+        refreshed, journal = workspace.load(P)
+        self.assertIn('one', refreshed.nodes)
+        self.assertEqual(next(iter(dict(bulk_attempt_records(journal)).values()))['work_request']['status'], 'IN_PROGRESS')
+        self.assertEqual(sum(e[0] == 'write' for e in self.g.events), 1)
+        self.assertEqual(self.run_cli('--delete', ['--confirm-parent', P, '--wait-seconds', '0.001']), 2)
+        request['status'] = 'SUCCEEDED'
+        self.g.resources.pop('one')
+        self.assertEqual(self.run_cli(), 0)
+        refreshed, journal = workspace.load(P)
+        self.assertNotIn('one', refreshed.nodes)
+        self.assertEqual(journal.records['one']['attempts'], state.records['one']['attempts'])
+        self.assertEqual(self.run_cli('--delete', ['--confirm-parent', P, '--wait-seconds', '1']), 0)
+        self.assertEqual(sum(e[0] == 'write' for e in self.g.events), 1)
+
+    def test_pending_original_child_scope_survives_deleted_compartment_refresh(self):
+        from test_executor import IntegratedGateway
+        from compartment_cleanup.discovery import discover
+        from compartment_cleanup.executor import submit_bulk
+        from compartment_cleanup.store import reconcile_state
+        self.g = IntegratedGateway()
+        self.factory.return_value = self.g
+        cli.build_registry.return_value = self.registry
+        self.g.catalog = [{'name': 'Volume', 'metadata_keys': []}]
+        child = 'ocid1.compartment.oc1..child'
+        self.g.compartment_links[child] = P
+        original = Node('one', 'Volume', R, child, '', 'AVAILABLE', '', 'unresolved', {})
+        self.g.add(original)
+        workspace = Workspace(self.path)
+        plan = discover(self.g, P, self.registry)
+        state = reconcile_state(plan, None)
+        with workspace.locked():
+            workspace.save_plan(plan)
+            workspace.save_state(state)
+            result = submit_bulk(self.g, plan, [plan.nodes['one']], 'child-token',
+                                 registry=self.registry, workspace=workspace, state=state)
+        self.g.resources['one'] = replace(original, lifecycle_state='TERMINATED')
+        self.g.deleted_compartments[child] = self.g.compartment_links.pop(child)
+        request = self.g.work_requests[result.request_id]
+        request['status'] = 'IN_PROGRESS'
+        self.assertEqual(self.run_cli(), 2)
+        refreshed, journal = workspace.load(P)
+        self.assertEqual(refreshed.compartments[child], P)
+        self.assertIn(child, refreshed.nodes)
+        self.assertIn('one', refreshed.nodes)
+        self.assertEqual(self.run_cli(), 2)
+        self.assertEqual(self.run_cli('--delete', ['--confirm-parent', P, '--wait-seconds', '0.001']), 2)
+        request['status'] = 'SUCCEEDED'
+        self.g.resources.pop('one')
+        self.assertEqual(self.run_cli(), 0)
+        refreshed, journal = workspace.load(P)
+        self.assertNotIn(child, refreshed.compartments)
+        self.assertNotIn('one', refreshed.nodes)
+        self.assertEqual(journal.records['one']['attempts'], state.records['one']['attempts'])
+        self.assertEqual(self.run_cli('--delete', ['--confirm-parent', P, '--wait-seconds', '1']), 0)
+        self.assertEqual(sum(e[0] == 'write' for e in self.g.events), 1)

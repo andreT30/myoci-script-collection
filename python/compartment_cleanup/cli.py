@@ -6,7 +6,7 @@ import re
 import sys
 
 from .discovery import discover
-from .executor import cleanup_result, execute, reconcile_report
+from .executor import cleanup_result, execute, preserve_report_members, reconcile_report
 from .gateway import build_gateway
 from .handlers.base import Registry
 from .handlers.core import BlockBootVolumes, ComputeInstances, IAMPolicies
@@ -91,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.report:
                 previous = reconcile_report(plan, state, workspace, gateway, registry) if plan is not None else None
                 fresh = discover(gateway, args.compartment_id, registry, previous=previous)
+                fresh = preserve_report_members(plan, fresh, state)
                 state = reconcile_state(fresh, state)
                 # Save the initial journal before any bulk reconciliation reads.
                 workspace.save_plan(fresh)

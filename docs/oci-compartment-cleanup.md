@@ -93,7 +93,9 @@ A successful report exits 0 even when resources or blockers remain; a failed or
 unsupported discovery probe returns 2. Read `report.txt` for dependency order,
 coverage gaps, unknown methods, external relationships and progress.
 
-An edge `A -> B` means remove A before B. Greater graph depths run first; there is
+An edge `A -> B` means remove A before B. Dependency depth is the longest
+chain of resources waiting on this resource's removal, plus one. Greater depths
+run first; this is dependency depth, distinct from compartment nesting. There is
 no fixed maximum depth. Cycles and unresolved predecessors block the affected
 branch. Independent safe branches can progress. An accepted asynchronous action
 or elapsed scheduled timestamp does not unblock its dependent resource.
@@ -196,7 +198,7 @@ eligible.
 | LB and NLB | Typed configuration, subnet/NSG/TLS references; direct deletion and exact service work-request reconciliation; owner configuration cascade | External backend servers/subnets are retained references; unknown configuration or unproved cascade effects block |
 | Object Storage | Canonical namespace and bucket identity; all objects/versions/markers, uploads, PARs, lifecycle/retention/replication records; exact-version deletion, eligible preparations and bucket deletion | Active locked/indefinite retention, unknown retention eligibility, inbound/outbound replication and read-only buckets block; replication is not silently detached |
 | Certificates | Certificates, CAs, CA bundles, issuer/consumer relationships; scheduled certificate/CA deletion and immediate bundle deletion | External/unreadable issued children or consumers and CRL configuration effects block |
-| Vault, keys and secrets | Fresh validated KMS endpoints, visible full-tenancy key membership/counts and typed consumers; proven vault-key cascades, individual schedules, secret regional replication evidence | Unknown endpoints/counts, EXTERNAL protection, unresolved replica/cascade identity or external consumers block; purge absence alone is not proof |
+| Vault, keys and secrets | Fresh validated KMS endpoints, visible full-tenancy key membership/counts and typed consumers; proven vault-key cascades, individual schedules, secret regional replication evidence | Unknown endpoints/counts, EXTERNAL vault cascade/count proof, unresolved replica/cascade identity or external consumers block; purge absence alone is not proof |
 | Logging Analytics | Namespaces, entities, object collection rules, EM bridges and service connectors; exact object-rule entity edges; direct deletion after verified checks | Manual `NONE` entities with resolved associations/producers can be eligible; automatic SCH/EM per-entity mapping remains unsupported; no native entity bulk deletion |
 
 Standalone instance termination explicitly preserves boot volumes and
@@ -216,7 +218,11 @@ terminal proofs have narrow purge corroboration for certificates, CA bundles,
 empty unreplicated standard vaults and unreplicated secrets, among other typed
 handlers. KMS keys whose verified endpoint becomes unavailable, nonempty vault
 cascades, uncertain replicas and purged resources without positive proof can
-remain unresolved.
+remain unresolved. Individually verified EXTERNAL key references can be scheduled
+for deletion from OCI; external key material is retained, as documented for
+[external key references](https://docs.oracle.com/en-us/iaas/Content/KeyManagement/Tasks/ekms_deleting_key_references.htm).
+EXTERNAL vault cascades
+remain blocked when complete membership/count evidence is unavailable.
 
 ### Bulk operations
 

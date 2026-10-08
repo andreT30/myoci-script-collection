@@ -697,9 +697,13 @@ def _apply_observation(state, node, observation):
     elif observation.scheduled_at is not None:
         record['scheduled_at'] = observation.scheduled_at
 
-def _previous(plan, state):
+def _previous(plan, state, *, preserve_groups=False):
     """Drop only positively reconciled removals from historical refresh inventory."""
-    done = {k for k, r in resource_records(state).items() if r.get('status') == 'deleted' and k != plan.parent_id}
+    group_members = _required_iam_members(plan, state)
+    required = group_members if preserve_groups else set()
+    required_scope = _iam_member_scope(plan, group_members)
+    done = {k for k, r in resource_records(state).items()
+            if r.get('status') == 'deleted' and k != plan.parent_id and k not in required and k not in required_scope}
     return replace(plan, nodes={k: v for k, v in plan.nodes.items() if k not in done}, compartments={k: v for k, v in plan.compartments.items() if k not in done}, edges=[e for e in plan.edges if e.before not in done and e.after not in done], probes=[p for p in plan.probes if p.compartment_id not in done], depths={k: v for k, v in plan.depths.items() if k not in done})
 
 @contextmanager
@@ -949,6 +953,11 @@ def execute(plan, state, workspace, gateway, registry, supplied_parent, wait_sec
             hierarchy_drift = moved & scope or set(live.compartments) - scope or any((live.compartments.get(k) != v for k, v in plan.compartments.items() if state.records.get(k, {}).get('status') != 'deleted'))
         live, added, moved = _inventory(gateway, plan, state, registry)
         incomplete = bool(added or moved or hierarchy_drift or (not live.probes) or any((p.status != 'complete' for p in live.probes)) or any((k != plan.parent_id and state.records.get(k, {}).get('status') not in ('deleted', 'prepared') for k in plan.nodes)) or any((k != plan.parent_id and state.records.get(k, {}).get('status') not in ('deleted', 'prepared') for k in live.nodes)))
+        incomplete = incomplete or any(
+            attempt.get('service') == 'identity'
+            and attempt.get('work_request', {}).get('status') not in _TERMINAL
+            and attempt.get('status') not in ('failed', 'deleted')
+            for _, attempt in bulk_attempt_records(state))
         incomplete = incomplete or any(record.get('proof_invalidations') and record.get('status') not in ('deleted', 'prepared')
                                        for record in resource_records(state).values())
         state.records.setdefault(plan.parent_id, {'status': 'retained', 'attempts': []})['verification'] = {'complete': not incomplete, 'added': sorted(added), 'moved': sorted(moved), 'coverage': [{'service': p.service, 'region': p.region, 'compartment_id': p.compartment_id, 'status': p.status} for p in live.probes]}
@@ -958,6 +967,74 @@ def execute(plan, state, workspace, gateway, registry, supplied_parent, wait_sec
         except Exception as error:
             raise JournalError('Cannot persist final cleanup report') from error
     return state
+
+def _required_iam_members(plan, state):
+    """Keep whole original groups until exact terminal evidence permits omission."""
+    required = set()
+    for _, attempt in bulk_attempt_records(state):
+        if attempt.get('service') != 'identity':
+            continue
+        complete = (attempt.get('home_region') == plan.home_region
+                    and attempt.get('region') == plan.home_region
+                    and all(_positive_iam_item(attempt, key) for key in attempt['node_keys']))
+        if not complete:
+            required.update(attempt['node_keys'])
+    return required
+
+
+def _iam_member_scope(plan, members):
+    compartments = set()
+    for key in members:
+        node = plan.nodes.get(key)
+        if node is None:
+            continue
+        current = node.compartment_id
+        while current != plan.parent_id and current in plan.compartments:
+            compartments.add(current)
+            current = plan.compartments[current]
+    return compartments
+
+
+def preserve_report_members(saved, fresh, state):
+    """Validate a refreshed candidate before publishing it to the workspace.
+
+    Discovery may omit a typed terminal tombstone. An unfinished IAM group still
+    needs every original typed member to inspect its immutable request later.
+    """
+    if saved is None:
+        return fresh
+    required = _required_iam_members(saved, state)
+    missing = required - set(fresh.nodes)
+    if required - set(saved.nodes):
+        raise CleanupError('Pending original group lacks saved resource identities after refresh')
+    compartments = dict(fresh.compartments)
+    historical_scope = _iam_member_scope(saved, required) - set(compartments)
+    for compartment in historical_scope:
+        compartments[compartment] = saved.compartments[compartment]
+    missing.update(historical_scope)
+    nodes = dict(fresh.nodes)
+    for key in missing:
+        nodes[key] = saved.nodes[key]
+    edges = list(fresh.edges)
+    for edge in saved.edges:
+        if ((edge.before in missing or edge.after in missing)
+                and edge.before in nodes and edge.after in nodes and edge not in edges):
+            edges.append(edge)
+    candidate = replace(fresh, compartments=compartments, nodes=nodes, edges=edges)
+    validate_scope(candidate, saved.parent_id)
+    for _, attempt in bulk_attempt_records(state):
+        if attempt.get('service') != 'identity' or not set(attempt['node_keys']) & required:
+            continue
+        expected = {row['identifier']: row['entity_type'] for row in attempt['resources']}
+        for key in attempt['node_keys']:
+            node = nodes[key]
+            if (expected.get(key) != node.resource_type
+                    or node.compartment_id != attempt['compartment_id']
+                    or node.region != attempt['node_regions'].get(key)):
+                raise CleanupError('Refreshed identity differs from pending original group')
+    candidate.depths, _ = compute_depths(candidate.nodes, candidate.edges)
+    return candidate
+
 
 def reconcile_report(plan, state, workspace, gateway, registry):
     """Refresh durable evidence using reads only, while the caller holds its lock.
@@ -1004,7 +1081,7 @@ def reconcile_report(plan, state, workspace, gateway, registry):
             _apply_observation(state, safe, observation)
     state.records.setdefault(plan.parent_id, {'status': 'retained', 'attempts': []}).pop('verification', None)
     _save(workspace, state)
-    return _previous(plan, state)
+    return _previous(plan, state, preserve_groups=True)
 
 
 def cleanup_result(plan, state):
