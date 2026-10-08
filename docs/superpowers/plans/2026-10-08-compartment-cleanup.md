@@ -34,7 +34,7 @@
 
 ## File Map and Execution Rules
 
-Create `python/oci_compartment_cleanup.py` as the executable entry point. Create a focused `python/compartment_cleanup/` package with `__init__.py`, `model.py`, `graph.py`, `store.py`, `reporting.py`, `gateway.py`, `discovery.py`, `executor.py`, `cli.py`, and `handlers/` containing `base.py`, `core.py`, `network.py`, `load_balancers.py`, `storage.py`, `scheduled.py`, and `logging_analytics.py`. Create `python/requirements-compartment-cleanup.txt` and `docs/oci-compartment-cleanup.md`; update README tool registration and prerequisites. Add tracked tests under `tests/compartment_cleanup/` without exposing existing ignored tests.
+Create `python/oci_compartment_cleanup.py` as the executable entry point. Create a focused `python/compartment_cleanup/` package with `__init__.py`, `model.py`, `graph.py`, `store.py`, `reporting.py`, `gateway.py`, `discovery.py`, `executor.py`, `cli.py`, and `handlers/` containing `base.py`, `core.py`, `network.py`, `load_balancers.py`, `storage.py`, `scheduled.py`, and `logging_analytics.py`. Create `python/requirements-compartment-cleanup.txt` and `docs/oci-compartment-cleanup.md`; update README tool registration and prerequisites. Add tests under `tests/compartment_cleanup/`.
 
 Run focused tests using `PYTHONPATH=python python3 -m unittest discover -s tests/compartment_cleanup -p 'test_<task>.py' -v`. Run the whole available suite with `PYTHONPATH=python python3 -m unittest discover -s tests/compartment_cleanup -v` before each commit. Read the current root tests to determine whether they have a runnable suite; run it at the final gate if present, and report any pre-existing failure by name. The working tree was clean before the design and plan; check it again before execution. Use an isolated worktree at execution time through the using-git-worktrees skill, leaving these reviewed documents accessible to the executor.
 
@@ -119,7 +119,7 @@ Task 4 defines the base `Handler.discover(gateway: Gateway, compartment_id: str,
 
 ## Task 1: Versioned Plan and Graph
 
-**Files:** Create `model.py`, `graph.py`, package `__init__.py`, and `tests/compartment_cleanup/test_graph.py`; modify `.gitignore` to track only the new test directory.
+**Files:** Create `model.py`, `graph.py`, package `__init__.py`, and `tests/compartment_cleanup/test_graph.py`.
 
 **Interfaces:** Produce the shared model, `plan_from_dict(data: dict) -> Plan`, `plan_to_dict(plan: Plan) -> dict`, `compute_depths(nodes: dict[str, Node], edges: list[Edge]) -> tuple[dict[str, int], dict[str, tuple[str, ...]]]`, and `validate_scope(plan: Plan, supplied_parent: str) -> set[str]`. The blocker dictionary identifies cycles and dangling edges; blocked nodes do not get runnable depths.
 
@@ -136,8 +136,8 @@ def test_seven_levels_are_deleted_deepest_first(self):
 
 - [ ] Run `test_graph.py` and observe failure from missing model/graph behavior. Add schema tests rejecting a wrong version, duplicate identity, parent marked delete, invalid compartment hierarchy, or edge referencing an external deletion target.
 - [ ] Implement dataclasses and strict JSON conversion. The graph traverses successors iteratively so a deep chain does not fail at Python's recursion limit. Set a leaf to depth 1 and its predecessor to one plus the maximum successor depth. A cycle blocks all nodes in the cycle and every prerequisite reachable downstream from it. Validate the parent using the live hierarchy during execution as well as the file's hierarchy.
-- [ ] Replace `/tests/` in `.gitignore` with `/tests/*` followed by `!/tests/compartment_cleanup/`; retain the existing unrelated ignored tests. Add ignore entries for the default `.oci-cleanup/` directory; user-selected directories outside it are documented as local artifacts.
-- [ ] Run the graph and full accumulated suites, plus `git diff --check`; commit the model, graph, new tests, and relevant ignore changes with `feat: add OCI cleanup dependency plan`.
+- [ ] Document the default `.oci-cleanup/` work directory and user-selected work directories as local artifacts that must be preserved until cleanup finishes.
+- [ ] Run the graph and full accumulated suites, plus `git diff --check`; commit the model, graph, and new tests with `feat: add OCI cleanup dependency plan`.
 
 ## Task 2: Atomic State, Work Directory Lock, and Reports
 
@@ -414,7 +414,7 @@ Document API-key configuration, instance-principal dynamic-group policies, all s
 - [x] Coverage gaps and universal inventory limits remain visible; no runtime catalog or guessed SDK operation is treated as proof of safe deletion.
 - [x] Review Focus conditions have tests assigned to their owning tasks.
 - [x] Interfaces and field names used by later tasks are defined above; code fragments are implementation targets gated by failing tests, not pre-written production code.
-- [x] Existing ignored tests remain unrelated and excluded; the new cleanup test suite is tracked.
+- [x] The cleanup test suite is located under `tests/compartment_cleanup/`.
 - [x] Plan and spec review precede execution; installed execution-helper availability is recorded explicitly.
 
 ## API References for Execution
