@@ -7,6 +7,7 @@ import re
 import oci
 
 from .gateway import discover_scope
+from .snapshot import DiscoverySnapshot
 from .graph import compute_depths, validate_scope
 from .model import CleanupError, Edge, Node, Plan, Probe, SCHEMA_VERSION
 
@@ -178,27 +179,50 @@ def discover(gateway, parent_id: str, registry, previous: Plan | None = None) ->
         if previous.tenancy_id != tenancy:
             raise CleanupError('Previous plan belongs to another tenancy')
     compartments = dict(compartments)
+    gateway = DiscoverySnapshot(gateway)
     probes = []
+    search_nodes, service_nodes, edges = [], [], []
+    ordered = sorted(compartments)
+    if any(not _COMPARTMENT.fullmatch(c) for c in ordered):
+        raise CleanupError('Invalid discovered compartment OCID')
+    # Search is the starting inventory. Usually one query per region; large
+    # trees use bounded batches, and gateway.items consumes every result page.
+    for region in regions:
+        for offset in range(0, len(ordered), 50):
+            batch = ordered[offset:offset + 50]
+            try:
+                values = ', '.join(f"'{c}'" for c in batch)
+                details = oci.resource_search.models.StructuredSearchDetails(
+                    query=f"query all resources where compartmentId IN ({values})")
+                rows = gateway.items('search', region, 'search_resources', {'search_details': details})
+                found = []
+                for row in rows:
+                    owner = row.get('compartment_id')
+                    if owner not in batch:
+                        raise CleanupError('Search returned an out-of-scope resource')
+                    found.append(_search_node(row, region, owner))
+                search_nodes.extend(found)
+                probes.extend(Probe('search', region, c, 'complete', '') for c in batch)
+                progress = getattr(gateway, 'progress', None)
+                if progress is not None:
+                    progress(f'Search found {len(found)} resources in {region} across {len(batch)} compartments')
+            except Exception:
+                probes.extend(Probe('search', region, c, 'failed', 'Search inventory failed') for c in batch)
     try:
         bulk_types = _catalog(gateway, home)
         probes.append(Probe('bulk_catalog', home, parent_id, 'complete', ''))
     except Exception:
         bulk_types = {}
         probes.append(Probe('bulk_catalog', home, parent_id, 'failed', 'Bulk catalog could not be established'))
-    search_nodes, service_nodes, edges = [], [], []
-    for compartment in sorted(compartments):
-        if not _COMPARTMENT.fullmatch(compartment):
-            raise CleanupError('Invalid discovered compartment OCID')
+    for compartment in ordered:
         for region in regions:
-            try:
-                details = oci.resource_search.models.StructuredSearchDetails(
-                    query=f"query all resources where compartmentId = '{compartment}'")
-                rows = gateway.items('search', region, 'search_resources', {'search_details': details})
-                search_nodes.extend(_search_node(row, region, compartment) for row in rows)
-                probes.append(Probe('search', region, compartment, 'complete', ''))
-            except Exception:
-                probes.append(Probe('search', region, compartment, 'failed', 'Search inventory failed'))
-            for name, handler in registry.handlers.items():
+            candidates = {n.resource_type for n in search_nodes
+                          if n.compartment_id == compartment and n.region == region}
+            # Enrich the discovered families first. Other handlers perform
+            # supplemental typed inventories because Search can omit resources.
+            handlers = sorted(registry.handlers.items(),
+                              key=lambda item: not bool(set(item[1].resource_types) & candidates))
+            for name, handler in handlers:
                 try:
                     found, references, coverage = handler.discover(gateway, compartment, region)
                     classified = []

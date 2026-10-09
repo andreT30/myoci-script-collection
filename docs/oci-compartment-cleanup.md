@@ -203,9 +203,12 @@ python3 python/oci_compartment_cleanup.py --report \
   --work-dir .oci-cleanup/example --auth instance_principal
 ```
 
-Report mode reads OCI and writes local artifacts. It discovers all subscribed
-regions and the tenancy home region, queries Search, supplements it with typed
-service inventories, and inspects pending schedules. It submits no OCI mutations.
+Report mode reads OCI and writes local artifacts. After discovering the
+compartment tree and subscribed regions, it starts with a Search query for the
+whole tree in each region and reads every result page. Trees with more than 50
+compartments use batches of up to 50 compartments per query. It then maps the
+returned resource families first, supplements Search with typed service
+inventories, and inspects pending schedules. It submits no OCI mutations.
 A successful report exits 0 even when resources or blockers remain; a failed or
 unsupported discovery probe returns 2. Read `report.txt` for dependency order,
 coverage gaps, unknown methods, external relationships and progress.
@@ -219,6 +222,15 @@ timeouts or retries. A `Starting` message without a matching `Completed` or
 files are saved after discovery completes; their absence during an initial scan
 does not mean the process is idle. To interrupt report mode, press Ctrl+C and
 rerun the same report command, preserving the work directory.
+
+Identical service inventories and resource reads are reused within one discovery
+run. Compute and network handlers check local roots first and scan external
+dependencies when local resources are present or the local inventory is
+unresolved. Supplemental inventories remain necessary because Search omits some
+resource types and recent changes can
+take time to appear. Reused results are discarded after discovery; deletion
+preflight and later runs make fresh reads. Failed inventories remain coverage
+failures, including when another handler needs the same inventory.
 
 An edge `A -> B` means remove A before B. Dependency depth is the longest
 chain of resources waiting on this resource's removal, plus one. Greater depths

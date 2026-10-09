@@ -90,11 +90,11 @@ def _ads(gateway, region):
     return names
 
 
-def _attachments(gateway, region, kinds=('VnicAttachment','VolumeAttachment','BootVolumeAttachment')):
+def _attachments(gateway, region, kinds=('VnicAttachment','VolumeAttachment','BootVolumeAttachment'), compartments=None):
     """Boot volumes can also be attached as data volumes; enumerate both families."""
     result = []
     domains = _ads(gateway,region)
-    for compartment in _compartments(gateway):
+    for compartment in _compartments(gateway) if compartments is None else compartments:
         for kind in kinds:
             service, listing, _, _, _ = _COMPUTE[kind]
             for domain in domains if kind == 'BootVolumeAttachment' else [None]:
@@ -531,6 +531,24 @@ class ComputeInstances(_TypedHandler):
     def discover(self,gateway,compartment_id,region):
         nodes,edges,probes=[],[],[]
         scope=_scope(gateway)
+        # Establish local roots first. Without instances, attachments, or managed
+        # producers here, no instance cascade needs a tenancy-wide reverse scan.
+        # These typed seeds also find resources missing from the Search index.
+        try:
+            roots = gateway.items('compute',region,'list_instances',{'compartment_id':compartment_id})
+            for service,operation in (('compute_management','list_instance_pools'),
+                                      ('container_engine','list_clusters'),
+                                      ('container_engine','list_node_pools')):
+                roots += gateway.items(service,region,operation,{'compartment_id':compartment_id})
+            roots += [row for _,row in _attachments(gateway,region,compartments=(compartment_id,))]
+            if not roots:
+                return [],[],[Probe('compute:'+name,region,compartment_id,'complete',
+                                    'No local compute roots; external cascade scan not needed')
+                              for name in ('instances','producers','attachments','public_ips')]
+        except Exception:
+            # A failed local seed never establishes absence. Preserve the full
+            # inventory path and its explicit failures/blockers below.
+            pass
         try:
             members,unsupported=self._producers(gateway,region)
             probes.append(Probe('compute:producers',region,compartment_id,'complete',

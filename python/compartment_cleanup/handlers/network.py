@@ -272,7 +272,21 @@ class Networks(Handler):
         return replace(node,handler=self.name,action=action,metadata=metadata)
 
     def discover(self,gateway,compartment_id,region):
-        scope=_scope(gateway);inventory=_Inventory(gateway,region);nodes={};edges=[]
+        scope=_scope(gateway)
+        try:
+            roots=[]
+            for kind,(listing,_,_,_) in NETWORK_OPERATIONS.items():
+                roots.extend(gateway.items('network',region,listing,{'compartment_id':compartment_id}))
+            for listing in ('list_vlans','list_drg_attachments'):
+                roots.extend(gateway.items('network',region,listing,{'compartment_id':compartment_id}))
+            roots.extend(gateway.items('dns',region,'list_resolvers',{'compartment_id':compartment_id,'scope':'PRIVATE'}))
+            if not roots:
+                return [],[],[Probe('network:'+kind,region,compartment_id,'complete',
+                                    'No local network roots; external reverse scan not needed')
+                              for kind in (*NETWORK_OPERATIONS,'Vlan','DrgAttachment','LoadBalancer','NetworkLoadBalancer','Resolver','memberships')]
+        except Exception:
+            pass  # Failed seeds cannot prove absence; use the guarded full scan.
+        inventory=_Inventory(gateway,region);nodes={};edges=[]
         probes=[Probe('network:'+kind,region,compartment_id,'failed' if kind in inventory.failures else 'complete','Visible-tenancy typed inventory') for kind in (*NETWORK_OPERATIONS,'Vlan','DrgAttachment','LoadBalancer','NetworkLoadBalancer','Resolver','memberships')]
         for kind in NETWORK_OPERATIONS:
             for row in inventory.rows[kind]:
