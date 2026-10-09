@@ -267,7 +267,7 @@ is background context supplied for this project; its direct access returned 403
 during the audit and its claims are not used as API contracts. This tool uses
 singular entity deletes and does not claim a native Logging Analytics bulk API.
 
-## Exit codes and verification
+## Exit codes
 
 | Code | Meaning |
 | --- | --- |
@@ -280,12 +280,4 @@ returns `0` without loading credentials. A successful deletion prints:
 
 ```text
 Cleanup complete for the recorded discovery coverage; retained parent: <OCID>.
-```
-
-The offline suite verifies graph ordering, scope and cascades, pagination,
-SDK serialization, crashes and durable recovery, schedule resume, lock ownership,
-report refresh and CLI integration. It performs no live OCI deletion:
-
-```bash
-PYTHONPATH=python python3 -m unittest discover -s tests/compartment_cleanup
 ```
