@@ -14,10 +14,49 @@ recorded discovery coverage, not proof that every possible OCI resource type is
 absent. Unsupported resources, uncertain dependencies, failed probes and pending
 deletions remain visible blockers.
 
+## Get the files onto your workstation
+
+Use macOS or Linux with Python 3.10 or newer. The cleanup tool consists of an
+entry script and a Python package; keep them together in the layout shown below.
+
+The simplest option is to clone the repository and enter its root directory:
+
+```bash
+git clone https://github.com/andreT30/myoci-script-collection.git
+cd myoci-script-collection
+```
+
+If you do not use Git, download the repository using **Code → Download ZIP** on
+GitHub, extract it, and open a terminal in the extracted repository directory.
+
+To copy only the cleanup tool instead, create a local directory and copy these
+items into it, preserving the `python/` directory layout:
+
+```text
+myoci-script-collection/
+└── python/
+    ├── oci_compartment_cleanup.py
+    ├── requirements-compartment-cleanup.txt
+    └── compartment_cleanup/       (copy this entire directory)
+        ├── __init__.py
+        ├── cli.py
+        ├── ...                    (keep all other Python modules)
+        └── handlers/              (keep all service handlers)
+```
+
+The other collection tools are optional for compartment cleanup. Copying only
+`oci_compartment_cleanup.py` is insufficient: it imports the accompanying
+`compartment_cleanup/` package, including `__init__.py` and every service handler.
+Keep a copy of this guide for reference.
+
+Run all commands below from the directory containing `python/`, whether you
+cloned the repository, extracted the ZIP, or copied the minimum files. The
+example `.oci-cleanup/example` work directory will be created beneath that
+directory; preserve it across report and deletion runs until cleanup finishes.
+
 ## Install and authenticate
 
-Run these commands from the repository root on macOS or Linux, using Python 3.10
-or newer. This tool uses the OCI Python SDK directly and does not require the OCI
+This tool uses the OCI Python SDK directly and does not require the OCI
 CLI. Its supported SDK minimum is 2.187.0.
 
 ```bash
