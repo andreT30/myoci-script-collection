@@ -39,16 +39,18 @@ chmod +x bash/*.sh python/*.py
 
 **These commands create local files. Preserve the entire work directory until cleanup is finished.**
 
-Install the SDK requirements, generate a report, review its dependencies and
+Install the SDK requirements, generate a report, review its resources and
 coverage gaps, then use explicit deletion with the same parent confirmation.
 Repeat that delete command as scheduled deletions mature. OCI has no universal
 inventory; unsupported resources and unresolved evidence keep cleanup incomplete.
 The selected parent is retained. Read the [cleanup guide](docs/oci-compartment-cleanup.md)
 for commands, authentication, scope/cascade effects, coverage and local artifacts.
 
-Reports default to Search-visible resources and their related children, skipping
-unrelated services. Add `--exhaustive-discovery` to a report for a broader, slower
-scan. Deletion retains full inventory and fresh dependency checks.
+Reports start with Search metadata across the compartment tree and subscribed
+regions. Deletion checks each target and investigates dependencies when OCI
+rejects an action. Report mode asks for uppercase `YES`; deletion asks twice.
+The terminal shows a compact summary; `--verbose` adds details. Add
+`--exhaustive-discovery` to a report for a broader, slower scan.
 
 ## Tenancy resource inventory
 

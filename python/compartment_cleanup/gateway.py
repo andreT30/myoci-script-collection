@@ -6,6 +6,7 @@ No credential, request payload, or raw SDK exception is included in diagnostics.
 from datetime import date, datetime
 from urllib.parse import urlsplit
 import time
+import re
 
 import oci
 
@@ -174,16 +175,30 @@ _OPERATIONS = {
 }
 
 
+def safe_service_message(message):
+    """Bounded service diagnostic text, excluding credential-like contents.
+
+    This accepts only ServiceError.message, never request/body/header dumps.
+    Credential markers redact the whole message rather than guessing their end.
+    """
+    if not isinstance(message, str):
+        return ''
+    if re.search(r'(?i)(authorization|bearer\s|private[ _-]?key|password|secret[ _-]?access[ _-]?key|security[ _-]?token|api[ _-]?key|signature[=:])', message):
+        return '[credential-like service message redacted]'
+    return ''.join(char if char.isprintable() else ' ' for char in message[:512])
+
+
 class GatewayError(CleanupError):
     """Safe failure context. Absence and authorization errors are ambiguous."""
     observation_status = 'unresolved'
 
-    def __init__(self, service, operation, status=None, code=None, request_id=None):
+    def __init__(self, service, operation, status=None, code=None, request_id=None, message=None):
         self.service = service
         self.operation = operation
         self.status = status
         self.code = code
         self.request_id = request_id
+        self.message = safe_service_message(message)
         super().__init__(f'{service}.{operation} unresolved (HTTP {status or "unavailable"})')
 
 
@@ -290,7 +305,7 @@ class Gateway:
             if self.progress is not None:
                 self.progress(f'Failed {label} after {time.monotonic() - started:.1f}s (HTTP {error.status})')
             raise GatewayError(service, operation, error.status, error.code,
-                               (error.headers or {}).get('opc-request-id')) from None
+                               (error.headers or {}).get('opc-request-id'), error.message) from None
         except CleanupError:
             if self.progress is not None:
                 self.progress(f'Failed {label} after {time.monotonic() - started:.1f}s')

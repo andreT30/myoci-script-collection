@@ -188,12 +188,15 @@ def submit_bulk(gateway, plan, nodes, attempt_id, *, registry=None, workspace=No
             intent_saved=True
         try:
             results = handler.submit_group(gateway,safe,scope,attempt_id,before_write=before_write)
-        except Exception:
+        except Exception as error:
             if not intent_saved:raise
             attempt['status']='unresolved'
             _persist(workspace,state,nodes,attempt)
+            if isinstance(error, GatewayError) and error.status in (401,403):raise
             return Submission('unresolved',None,None,'Storage response lost; reconcile exact items without replay')
-        attempt['status']='pending' if any(r.operation_evidence for r in results.values()) else 'unresolved'
+        attempt['status']=('failed' if results and all(r.status=='failed' for r in results.values())
+                           else 'pending' if any(r.status=='pending' and r.operation_evidence for r in results.values())
+                           else 'unresolved')
         attempt['resource_evidence']={key:r.operation_evidence for key,r in results.items() if r.operation_evidence}
         attempt['resource_status']={key:r.status for key,r in results.items()}
         _persist(workspace,state,nodes,attempt)

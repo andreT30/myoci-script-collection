@@ -29,6 +29,8 @@ def render_report(plan: Plan, state: State) -> str:
              'Preserve this work directory until cleanup is finished.', '']
     if any(p.service == 'inventory_mode' and p.detail == 'search' for p in plan.probes):
         lines.insert(3, 'Discovery: Search-visible resources and related children only; unindexed resources may be omitted. External dependency checks run before deletion.')
+    if any(p.service == 'inventory_mode' and p.detail == 'search_inventory' for p in plan.probes):
+        lines.insert(3, 'Discovery: Search inventory; unindexed resources may be omitted. Missing handlers are deletion capability gaps, not discovery failures.')
     pending = []
 
     def resource(key):
@@ -126,4 +128,109 @@ def render_report(plan: Plan, state: State) -> str:
     if pending:
         earliest = min(pending, key=lambda value: datetime.fromisoformat(value.replace('Z', '+00:00')))
         lines.append('Next known revisit time: ' + earliest + '; an earliest known condition, not a promise of completion.')
+    return '\n'.join(lines) + '\n'
+
+
+def render_terminal_summary(plan: Plan, state: State, *, width: int = 100) -> str:
+    """Readable counts and all pending dates; detailed identities stay in artifacts."""
+    from collections import Counter
+    import textwrap
+
+    width = max(40, int(width))
+    lines = []
+
+    def line(value=''):
+        safe = _display(value)
+        lines.extend(textwrap.wrap(safe, width=width, subsequent_indent='  ',
+                                   break_long_words=True, break_on_hyphens=False) or [''])
+
+    def short(key):
+        return '…' + _display(key)[-12:] if len(key) > 16 else _display(key)
+
+    def counts(title, values):
+        line(title)
+        ordered = sorted(values.items(), key=lambda item: (-item[1], item[0]))
+        for label, count in ordered[:8]:
+            line(f'  {_display(label) or "global"}: {count}')
+        if len(ordered) > 8:
+            line(f'  … {len(ordered) - 8} more groups; see report.txt')
+
+    records = resource_records(state)
+    parent = plan.nodes.get(plan.parent_id)
+    line('OCI cleanup')
+    line('Retained parent: ' + (_display(parent.display_name) if parent and parent.display_name else short(plan.parent_id)))
+    line('Supplied parent will be retained.')
+    search = any(p.service == 'inventory_mode' and p.detail in {'search', 'search_inventory'} for p in plan.probes)
+    line('Discovery: ' + ('Search inventory; unindexed resources may be omitted.' if search else 'Recorded discovery probes; coverage is limited to those probes.'))
+    resources = [node for key, node in plan.nodes.items() if key != plan.parent_id]
+    line(f'Scope: {len(plan.compartments)} compartments; {len(resources)} resources')
+    counts('Resources by type', Counter(node.resource_type for node in resources))
+    regional_counts = Counter()
+    for node in resources:
+        sightings = node.metadata.get('search_regions')
+        regions = set(region for region in sightings if isinstance(region, str)) if isinstance(sightings, list) else set()
+        regional_counts.update(regions or {node.region})
+    counts('Resources by region (regional sightings)', regional_counts)
+    counts('Resources by compartment', Counter(short(node.compartment_id) for node in resources))
+
+    failed = [p for p in plan.probes if p.status != 'complete']
+    line(f'Inventory coverage failures: {len(failed)}')
+    grouped = Counter((p.service, p.region, p.status, _display(p.detail)) for p in failed)
+    for (service, region, status, detail), count in sorted(grouped.items())[:8]:
+        line(f'  {_display(service)} / {_display(region)}: {_display(status)} ({count}); {detail}')
+    if len(grouped) > 8:
+        line(f'  … {len(grouped) - 8} more failure groups; see report.txt')
+    unsupported = [node for node in resources if not node.handler and node.action not in ('retain', 'cascade')]
+    line(f'Missing deletion handlers: {len(unsupported)}')
+    unsupported_types = sorted(Counter(node.resource_type for node in unsupported).items())
+    for kind, count in unsupported_types[:8]:
+        line(f'  {_display(kind)}: {count}; manual action required')
+    if len(unsupported_types) > 8:
+        line(f'  … {len(unsupported_types) - 8} more types; see report.txt')
+    failures = [(key, record) for key, record in records.items() if record.get('status') == 'failed']
+    line(f'Deletion failures: {len(failures)}')
+    grouped_errors = Counter(_display(json.dumps(record.get('errors', []), ensure_ascii=False)) for _, record in failures)
+    for error, count in sorted(grouped_errors.items())[:8]:
+        line(f'  {count}: {error}')
+    if len(grouped_errors) > 8:
+        line(f'  … {len(grouped_errors) - 8} more failure groups; see report.txt')
+
+    names = Counter(node.display_name for node in resources if node.display_name)
+    pending = []
+    pending_count = 0
+    known_dates = []
+    for key in sorted(set(plan.nodes) | set(records)):
+        node = plan.nodes.get(key)
+        record = records.get(key, {})
+        implicit = node and node.lifecycle_state in {'PENDING_DELETION', 'SCHEDULING_DELETION', 'DELETING'} and record.get('status', 'discovered') == 'discovered'
+        if record.get('status') != 'pending' and not implicit:
+            continue
+        stamp = _utc(record.get('scheduled_at') if not implicit else node.metadata.get('scheduled_at'))
+        if stamp:
+            known_dates.append(stamp)
+        name = (node.display_name if node else record.get('display_name')) or short(key)
+        kind = node.resource_type if node else record.get('resource_type', 'unknown type')
+        region = node.region if node else record.get('region', '')
+        if names.get(name, 0) > 1:
+            name += ' [' + short(key) + ']'
+        identity = f'{name} | {kind}' + (f' | {region}' if region else '')
+        scheduled = (node and node.action == 'schedule') or record.get('lifecycle_state') in {'PENDING_DELETION', 'SCHEDULING_DELETION'}
+        date = stamp or ('unknown UTC schedule; verification required' if scheduled or implicit else 'asynchronous deletion; verification required')
+        pending_count += 1
+        pending.append(identity + ' | ' + date)
+        if node is None:
+            pending.append('  absent from inventory; history preserved')
+    line('Pending deletions: ' + str(pending_count))
+    if pending_count:
+        line('Cleanup cannot finish until these resources are confirmed deleted.')
+    for entry in pending:
+        line('  ' + entry)
+    if known_dates:
+        earliest = min(known_dates, key=lambda value: datetime.fromisoformat(value.replace('Z', '+00:00')))
+        line('Next known revisit time: ' + earliest + '; verify removal on rerun.')
+    orphans = [(key, record) for key, record in records.items() if key not in plan.nodes and record.get('status') != 'pending']
+    if orphans:
+        line(f'Retained journal history absent from inventory: {len(orphans)}')
+        for key, record in orphans[:8]:
+            line(f'  {short(key)}: {_display(record.get("status", "unresolved"))}; history preserved')
     return '\n'.join(lines) + '\n'

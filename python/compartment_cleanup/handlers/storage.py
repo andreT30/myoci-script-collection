@@ -498,5 +498,18 @@ class Storage(Handler):
                     'region':node.region,'operation':'batch_delete_objects','etag':observations[node.key].etag,
                     'submitted_at':self.now().isoformat(),'deleted_at':timestamp}
                 results[node.key]=Submission('pending',None,None,'Exact batch item completed; postflight reconciliation required',evidence)
+            for row in data['failed']:
+                status=row.get('status_code')
+                message=row.get('error_message')
+                if type(status) is not int or not 400<=status<=599 or not isinstance(message,str):
+                    continue  # Unknown failure shape remains an unresolved replay barrier.
+                node=names[row['object_name']]
+                from ..gateway import safe_service_message
+                evidence={'node_key':node.key,'bucket_id':node.metadata['bucket_id'],
+                    'bucket_created':node.metadata['bucket_created'],'region':node.region,
+                    'operation':'batch_delete_objects','submitted_at':self.now().isoformat(),
+                    'failure':{'status_code':status,'message':safe_service_message(message)}}
+                results[node.key]=Submission('failed',None,None,
+                    'Exact batch item failed; inspect its service diagnostic before an individually confirmed retry',evidence)
         except Exception:return {n.key:Submission('unresolved',None,None,'Malformed batch completion; reconcile without replay') for n in nodes}
         return results
