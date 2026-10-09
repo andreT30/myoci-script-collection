@@ -7,6 +7,7 @@ import re
 import sys
 
 from .discovery import discover
+from .candidates import CandidateSnapshot
 from .executor import cleanup_result, execute, preserve_report_members, reconcile_report
 from .gateway import build_gateway
 from .handlers.base import Registry
@@ -53,6 +54,8 @@ def _parser():
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument('--report', action='store_true', help='read OCI and write a local plan/report')
     modes.add_argument('--delete', action='store_true', help='execute the saved plan after fresh scope checks')
+    parser.add_argument('--exhaustive-discovery', action='store_true',
+                        help='report only: scan all implemented services, including resources absent from Search (slow)')
     parser.add_argument('--compartment-id', required=True, help='retained parent compartment OCID')
     parser.add_argument('--work-dir', required=True, help='durable plan, action history and report directory')
     parser.add_argument('--confirm-parent', help='required in delete mode; exact retained parent OCID')
@@ -79,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error('invalid retained compartment OCID')
         if args.delete and args.confirm_parent != args.compartment_id:
             parser.error('--delete requires --confirm-parent exactly matching --compartment-id')
+        if args.delete and args.exhaustive_discovery:
+            parser.error('--exhaustive-discovery is available only with --report')
     except SystemExit as error:
         return int(error.code)
     workspace = Workspace(Path(args.work_dir).expanduser())
@@ -98,16 +103,20 @@ def main(argv: list[str] | None = None) -> int:
             gateway.progress = _progress
             registry = build_registry()
             if args.report:
-                _progress('Discovering resources across subscribed regions and checking external dependencies')
-                previous = reconcile_report(plan, state, workspace, gateway, registry) if plan is not None else None
-                fresh = discover(gateway, args.compartment_id, registry, previous=previous)
+                _progress('Discovering resources: ' + ('exhaustive service scans' if args.exhaustive_discovery
+                          else 'Search candidates and related children only'))
+                view = gateway if args.exhaustive_discovery or plan is None else CandidateSnapshot(gateway, plan.nodes.values())
+                previous = reconcile_report(plan, state, workspace, view, registry) if plan is not None else None
+                fresh = discover(gateway, args.compartment_id, registry, previous=previous,
+                                 exhaustive=args.exhaustive_discovery)
                 fresh = preserve_report_members(plan, fresh, state)
                 state = reconcile_state(fresh, state)
                 _progress(f'Saving discovery report: {len(fresh.nodes)} resources, {len(fresh.probes)} coverage probes')
                 # Save the initial journal before any bulk reconciliation reads.
                 workspace.save_plan(fresh)
                 workspace.save_state(state)
-                reconcile_report(fresh, state, workspace, gateway, registry)
+                view = gateway if args.exhaustive_discovery else CandidateSnapshot(gateway, fresh.nodes.values())
+                reconcile_report(fresh, state, workspace, view, registry)
                 text = render_report(fresh, state)
                 workspace.save_report(text)
                 print(text, end='')

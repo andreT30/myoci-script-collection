@@ -157,8 +157,9 @@ removing it can stop the run or lose the history. The signer supplies tenancy an
 arguments apply to API-key authentication. See [instance principals](https://docs.oracle.com/en-us/iaas/Content/Identity/Tasks/callingservicesfrominstances.htm).
 
 The identity needs permission to read the tenancy hierarchy and region
-subscriptions, Search, bulk-action catalog, and each implemented service's
-inventory and dependency APIs. Read-only reverse-dependency scans include visible
+subscriptions, Search, bulk-action catalog, and the discovered services'
+inventory and dependency APIs. Delete mode and exhaustive reports use read-only
+reverse-dependency scans that include visible
 compartments outside the cleanup tree: those reads find external consumers and
 producers that may block an in-tree action. Delete mode additionally needs each
 applicable service's delete, detach, update or scheduled-deletion permissions,
@@ -203,34 +204,42 @@ python3 python/oci_compartment_cleanup.py --report \
   --work-dir .oci-cleanup/example --auth instance_principal
 ```
 
-Report mode reads OCI and writes local artifacts. After discovering the
-compartment tree and subscribed regions, it starts with a Search query for the
-whole tree in each region and reads every result page. Trees with more than 50
-compartments use batches of up to 50 compartments per query. It then maps the
-returned resource families first, supplements Search with typed service
-inventories, and inspects pending schedules. It submits no OCI mutations.
+Report mode reads OCI and writes local artifacts. It first discovers the
+compartment tree and subscribed regions, then queries Search for the whole tree
+in each region, reading every result page. Trees with more than 50 compartments
+use batches of up to 50 compartments per query.
+
+By default, only resource families returned by Search are mapped. The tool reads
+those resources and their related children, such as bucket objects and VCN
+components. It skips unrelated services and regions without matching resources.
+Previously recorded resources are also checked so pending scheduled deletions
+remain visible even if Search stops returning them. No OCI mutations are submitted.
+
+Search can omit unindexed resources and recent changes. This default report does
+not establish that the compartment is empty or that external consumers are absent.
+Fresh external dependency checks still run before deletion and can take longer.
+For a broader, slower inventory of all implemented services, add
+`--exhaustive-discovery` to the report command. This is never enabled automatically.
+The report records its discovery mode. Deletion still runs full inventories and
+fresh external dependency checks before authorizing actions; a fast report alone
+does not authorize removal or certify absence. Report refreshes preserve uncertain
+removal history for those full deletion checks.
+
 A successful report exits 0 even when resources or blockers remain; a failed or
 unsupported discovery probe returns 2. Read `report.txt` for dependency order,
-coverage gaps, unknown methods, external relationships and progress.
+coverage gaps, unknown methods and progress.
 
-Progress messages are written immediately to standard error, with UTC timestamps,
-service, region, operation, and call duration. The final report is written to
-standard output. Discovery can take time because it also checks visible
-compartments outside the cleanup tree for dependencies, and calls may wait for
-timeouts or retries. A `Starting` message without a matching `Completed` or
-`Failed` message identifies the call currently in progress. The plan and report
-files are saved after discovery completes; their absence during an initial scan
-does not mean the process is idle. To interrupt report mode, press Ctrl+C and
-rerun the same report command, preserving the work directory.
+Progress messages appear immediately on standard error, with UTC timestamps,
+service, region, operation and call duration. The final report goes to standard
+output. A `Starting` message without a matching `Completed` or `Failed` message
+identifies the current call. Plan and report files are saved after discovery;
+an empty work directory during the first scan does not mean the process is idle.
+Press Ctrl+C to interrupt, then rerun the report command with the same work
+directory. Preserve that directory until cleanup is finished.
 
-Identical service inventories and resource reads are reused within one discovery
-run. Compute and network handlers check local roots first and scan external
-dependencies when local resources are present or the local inventory is
-unresolved. Supplemental inventories remain necessary because Search omits some
-resource types and recent changes can
-take time to appear. Reused results are discarded after discovery; deletion
-preflight and later runs make fresh reads. Failed inventories remain coverage
-failures, including when another handler needs the same inventory.
+Identical service inventories and resource reads are reused within one report.
+Failed inventories remain coverage failures. These temporary cached reads are
+discarded afterwards; deletion preflight and subsequent runs make fresh reads.
 
 An edge `A -> B` means remove A before B. Dependency depth is the longest
 chain of resources waiting on this resource's removal, plus one. Greater depths

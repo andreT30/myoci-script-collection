@@ -46,6 +46,10 @@ inventory; unsupported resources and unresolved evidence keep cleanup incomplete
 The selected parent is retained. Read the [cleanup guide](docs/oci-compartment-cleanup.md)
 for commands, authentication, scope/cascade effects, coverage and local artifacts.
 
+Reports default to Search-visible resources and their related children, skipping
+unrelated services. Add `--exhaustive-discovery` to a report for a broader, slower
+scan. Deletion retains full inventory and fresh dependency checks.
+
 ## Tenancy resource inventory
 
 `python/oci_tenancy_inventory.py` uses OCI Resource Search in every subscribed

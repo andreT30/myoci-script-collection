@@ -8,6 +8,7 @@ import oci
 
 from .gateway import discover_scope
 from .snapshot import DiscoverySnapshot
+from .candidates import CandidateSnapshot
 from .graph import compute_depths, validate_scope
 from .model import CleanupError, Edge, Node, Plan, Probe, SCHEMA_VERSION
 
@@ -170,7 +171,8 @@ def _bulk_node(node, registry, catalog):
     return replace(node, metadata=metadata)
 
 
-def discover(gateway, parent_id: str, registry, previous: Plan | None = None) -> Plan:
+def discover(gateway, parent_id: str, registry, previous: Plan | None = None, *, exhaustive=True) -> Plan:
+    # Internal callers retain compatibility; the CLI explicitly defaults to Search.
     if not isinstance(parent_id, str) or not _COMPARTMENT.fullmatch(parent_id):
         raise CleanupError('Invalid retained compartment OCID')
     tenancy, home, regions, compartments = discover_scope(gateway, parent_id)
@@ -214,31 +216,57 @@ def discover(gateway, parent_id: str, registry, previous: Plan | None = None) ->
     except Exception:
         bulk_types = {}
         probes.append(Probe('bulk_catalog', home, parent_id, 'failed', 'Bulk catalog could not be established'))
-    for compartment in ordered:
-        for region in regions:
-            candidates = {n.resource_type for n in search_nodes
-                          if n.compartment_id == compartment and n.region == region}
-            # Enrich the discovered families first. Other handlers perform
-            # supplemental typed inventories because Search can omit resources.
-            handlers = sorted(registry.handlers.items(),
-                              key=lambda item: not bool(set(item[1].resource_types) & candidates))
-            for name, handler in handlers:
-                try:
-                    found, references, coverage = handler.discover(gateway, compartment, region)
-                    classified = []
-                    for node in found:
-                        if node.compartment_id not in compartments or node.key in compartments:
-                            raise CleanupError('Service returned an out-of-scope resource')
-                        classified.append(registry.classify(node))
-                    if any(p.compartment_id != compartment or p.region != region for p in coverage):
-                        raise CleanupError('Invalid service coverage scope')
-                    service_nodes.extend(classified)
-                    edges.extend(references)
-                    probes.extend(coverage)
-                    if not coverage:
-                        probes.append(Probe(name, region, compartment, 'failed', 'Service returned no discovery coverage'))
-                except Exception:
-                    probes.append(Probe(name, region, compartment, 'failed', 'Service inventory failed'))
+    probes.append(Probe('inventory_mode', home, parent_id, 'complete', 'exhaustive' if exhaustive else 'search'))
+    if not exhaustive:
+        seeds = search_nodes + (list(previous.nodes.values()) if previous else [])
+        gateway = CandidateSnapshot(gateway, seeds)
+    tasks = [(compartment, region, name, handler)
+             for compartment in ordered for region in regions
+             for name, handler in registry.handlers.items()]
+    pending = list(tasks)
+    visited = set()
+    while pending:
+        compartment, region, name, handler = pending.pop(0)
+        if not exhaustive:
+            selected = tuple(sorted(n.key for n in gateway.candidates.values()
+                                    if n.compartment_id == compartment and n.region == region
+                                    and n.resource_type in handler.resource_types))
+            signature = (compartment, region, name, selected)
+            if not selected or signature in visited:
+                continue
+            visited.add(signature)
+            before = set(gateway.candidates)
+        try:
+            found, references, coverage = handler.discover(gateway, compartment, region)
+            classified = []
+            for node in found:
+                if node.compartment_id not in compartments or node.key in compartments:
+                    raise CleanupError('Service returned an out-of-scope resource')
+                classified.append(registry.classify(node))
+            if any(p.compartment_id != compartment or p.region != region for p in coverage):
+                raise CleanupError('Invalid service coverage scope')
+            if not exhaustive:
+                coverage = [replace(p, detail='Search-derived resource mapping; external verification deferred to deletion')
+                            if p.status == 'complete' else p for p in coverage]
+            if exhaustive:
+                service_nodes.extend(classified)
+            else:
+                replacements = {n.key for n in classified}
+                service_nodes = [n for n in service_nodes if n.key not in replacements] + classified
+            edges.extend(references)
+            names = {p.service for p in coverage}
+            probes = [p for p in probes if not (p.service in names and p.region == region and p.compartment_id == compartment)]
+            probes.extend(coverage)
+            if not coverage:
+                probes.append(Probe(name, region, compartment, 'failed', 'Service returned no discovery coverage'))
+        except Exception:
+            probes.append(Probe(name, region, compartment, 'failed', 'Service inventory failed'))
+        if not exhaustive and set(gateway.candidates) != before:
+            # Explicit GET/list relationships can reveal new children or families.
+            # Revisit only handlers whose candidate identities have changed.
+            pending = list(tasks)
+    if not exhaustive:
+        search_nodes = list(gateway.candidates.values())
     nodes = merge_nodes(search_nodes, service_nodes)
     authoritative_keys = {n.key for n in service_nodes}
     nodes = {key:_blocked(registry.classify(node), 'Search identity lacks authoritative service dependency evidence')
@@ -278,7 +306,7 @@ def discover(gateway, parent_id: str, registry, previous: Plan | None = None) ->
                 observation = handler.inspect(gateway, registry.classify(old), set(compartments)) if handler else None
             except Exception:
                 observation = None
-            if observation and observation.status == 'deleted':
+            if observation and observation.status == 'deleted' and exhaustive:
                 continue
             if old.compartment_id not in compartments:
                 # Preserve uncertain historical scope without targeting additions.

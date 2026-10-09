@@ -580,6 +580,14 @@ def _observe(gateway, node, scope, handler, state, plan=None):
     if handler is None:
         return Observation('unresolved', node.compartment_id, '', None, None, 'Unsupported resource')
     observation = handler.inspect(gateway, node, scope)
+    if getattr(gateway, 'search_driven', False):
+        # A restricted report inventory cannot corroborate terminal absence.
+        # Leave durable completion proof to the full deletion reconciliation.
+        if observation.status == 'deleted':
+            return Observation('unresolved', node.compartment_id, '', None, None,
+                               'Terminal verification requires full deletion checks')
+        _invalidate_contradicted_proofs(state, node, observation, plan)
+        return observation
     _invalidate_contradicted_proofs(state, node, observation, plan)
     if observation.status == 'unresolved' and type(handler) is Storage:
         identity = handler.observe_live_identity(gateway, node, scope)

@@ -27,6 +27,8 @@ def render_report(plan: Plan, state: State) -> str:
              f'Tenancy: {_display(plan.tenancy_id)}',
              'Coverage limitation: OCI has no universal resource inventory; this report covers recorded discovery probes only.',
              'Preserve this work directory until cleanup is finished.', '']
+    if any(p.service == 'inventory_mode' and p.detail == 'search' for p in plan.probes):
+        lines.insert(3, 'Discovery: Search-visible resources and related children only; unindexed resources may be omitted. External dependency checks run before deletion.')
     pending = []
 
     def resource(key):

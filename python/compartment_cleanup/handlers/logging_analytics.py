@@ -70,6 +70,9 @@ class LoggingAnalytics(Handler):
         return replace(node,handler=self.name,action='delete',metadata=metadata)
 
     def _namespaces(self,gateway,region):
+        if getattr(gateway,'search_driven',False) and not any(
+                gateway.has_kind(kind,region) for kind in _CONTRACTS if kind.startswith('LogAnalytics')):
+            return []
         data,headers=gateway.read('log_analytics',region,'list_namespaces',{'compartment_id':gateway.tenancy_id})
         if type(data) is not dict or type(data.get('items')) is not list or headers.get('opc-next-page'):
             raise CleanupError('Namespace response is incomplete')

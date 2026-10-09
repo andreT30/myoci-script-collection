@@ -237,8 +237,10 @@ class ScheduledResources(Handler):
                      ('Bucket','object_storage','list_buckets'))
         known={}
         for region in gateway.regions:
-            namespace,_=gateway.read('object_storage',region,'get_namespace',{})
-            if not isinstance(namespace,str) or not namespace: raise CleanupError('Object storage namespace unknown')
+            namespace=None
+            if not getattr(gateway,'search_driven',False) or gateway.has_kind('Bucket',region):
+                namespace,_=gateway.read('object_storage',region,'get_namespace',{})
+                if not isinstance(namespace,str) or not namespace: raise CleanupError('Object storage namespace unknown')
             for owner in _compartments(gateway):
                 for kind,service,operation in inventories:
                     params={'compartment_id':owner}
