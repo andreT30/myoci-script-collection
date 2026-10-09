@@ -13,11 +13,9 @@ venv/
 
 # Local development planning
 /docs/superpowers/
-/tests/superpowers/
 
-# Locally excluded tests
-/tests/*
-!/tests/compartment_cleanup/
+# Local tests
+/tests/
 
 # Generated OCI reports and payloads
 *.csv
