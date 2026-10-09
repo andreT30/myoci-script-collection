@@ -11,6 +11,10 @@ venv/
 .env
 .env.*
 
+# Local development planning
+/docs/superpowers/
+/tests/superpowers/
+
 # Locally excluded tests
 /tests/*
 !/tests/compartment_cleanup/
