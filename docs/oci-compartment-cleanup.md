@@ -66,15 +66,49 @@ directory; preserve it across report and deletion runs until cleanup finishes.
 This tool uses the OCI Python SDK directly and does not require the OCI
 CLI. Its supported SDK minimum is 2.187.0.
 
-Check the interpreter before installing. `python3 --version` must report 3.10 or
-newer. If your supported interpreter has a versioned name, such as `python3.11`,
-use that name instead of `python3` in **every** installation and tool command below.
+### Create a virtual environment
+
+Use a virtual environment to install the SDK separately from your system Python.
+This also handles the `error: externally-managed-environment` message that can
+appear with Homebrew Python on macOS or a package-managed Python on Linux.
+See the [Python packaging guidance](https://packaging.python.org/en/latest/specifications/externally-managed-environments/).
+
+From the directory containing `python/`, check that `python3 --version` reports
+3.10 or newer, then create and activate the environment:
 
 ```bash
+python3 --version
+python3 -m venv .venv
+source .venv/bin/activate
 python3 --version
 python3 -m pip install -r python/requirements-compartment-cleanup.txt
 python3 python/oci_compartment_cleanup.py --help
 ```
+
+If your supported interpreter has a versioned name, such as `python3.11`, use
+`python3.11 --version` and `python3.11 -m venv .venv` for the first two commands.
+After activation, `python3` uses the environment's interpreter. Creating a
+virtual environment with Python 3.9 does not upgrade it to Python 3.10.
+
+Keep the environment active when running the report and delete commands below.
+In each new terminal session, return to the same directory and reactivate it:
+
+```bash
+source .venv/bin/activate
+```
+
+Install the requirements once when creating the environment; later cleanup runs
+can reuse it. To leave the environment when you are done with the terminal session:
+
+```bash
+deactivate
+```
+
+The `.venv/` directory holds the interpreter and installed packages. The
+`.oci-cleanup/` work directory holds the cleanup plan and journal; preserve that
+work directory until cleanup finishes, including between terminal sessions.
+
+### Authentication and permissions
 
 For API-key authentication, configure an OCI SDK configuration file, normally
 `~/.oci/config`, with `user`, `fingerprint`, `tenancy`, `region`, and `key_file`.
