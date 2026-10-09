@@ -210,6 +210,16 @@ A successful report exits 0 even when resources or blockers remain; a failed or
 unsupported discovery probe returns 2. Read `report.txt` for dependency order,
 coverage gaps, unknown methods, external relationships and progress.
 
+Progress messages are written immediately to standard error, with UTC timestamps,
+service, region, operation, and call duration. The final report is written to
+standard output. Discovery can take time because it also checks visible
+compartments outside the cleanup tree for dependencies, and calls may wait for
+timeouts or retries. A `Starting` message without a matching `Completed` or
+`Failed` message identifies the call currently in progress. The plan and report
+files are saved after discovery completes; their absence during an initial scan
+does not mean the process is idle. To interrupt report mode, press Ctrl+C and
+rerun the same report command, preserving the work directory.
+
 An edge `A -> B` means remove A before B. Dependency depth is the longest
 chain of resources waiting on this resource's removal, plus one. Greater depths
 run first; this is dependency depth, distinct from compartment nesting. There is

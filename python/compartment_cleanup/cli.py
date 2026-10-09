@@ -1,5 +1,6 @@
 """Explicit read-only report and guarded deletion commands."""
 import argparse
+from datetime import datetime, timezone
 import math
 from pathlib import Path
 import re
@@ -21,6 +22,12 @@ from .store import Workspace, reconcile_state
 
 
 PRESERVE = 'These commands create local files. Preserve the entire work directory until cleanup is finished.'
+
+
+def _progress(message):
+    timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S UTC')
+    safe = ''.join(c if c.isprintable() else '?' for c in str(message))
+    print(f'[{timestamp}] {safe}', file=sys.stderr, flush=True)
 
 
 def build_registry():
@@ -85,14 +92,18 @@ def main(argv: list[str] | None = None) -> int:
                 plan, state = workspace.load(args.compartment_id)
             else:
                 plan = state = None
+            _progress('Loading OCI authentication')
             gateway = build_gateway(args.auth, str(Path(args.config_file).expanduser()),
                                     args.profile, args.bootstrap_region)
+            gateway.progress = _progress
             registry = build_registry()
             if args.report:
+                _progress('Discovering resources across subscribed regions and checking external dependencies')
                 previous = reconcile_report(plan, state, workspace, gateway, registry) if plan is not None else None
                 fresh = discover(gateway, args.compartment_id, registry, previous=previous)
                 fresh = preserve_report_members(plan, fresh, state)
                 state = reconcile_state(fresh, state)
+                _progress(f'Saving discovery report: {len(fresh.nodes)} resources, {len(fresh.probes)} coverage probes')
                 # Save the initial journal before any bulk reconciliation reads.
                 workspace.save_plan(fresh)
                 workspace.save_state(state)

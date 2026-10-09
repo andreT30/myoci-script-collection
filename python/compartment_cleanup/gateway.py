@@ -5,6 +5,7 @@ No credential, request payload, or raw SDK exception is included in diagnostics.
 """
 from datetime import date, datetime
 from urllib.parse import urlsplit
+import time
 
 import oci
 
@@ -215,6 +216,7 @@ class Gateway:
         self.cleanup_scope = set()
         self.compartment_records = {}
         self._clients = {}
+        self.progress = None
         self._vault_endpoints = {}
         self._read_retry = oci.retry.RetryStrategyBuilder(
             max_attempts_check=True, max_attempts=3,
@@ -273,17 +275,29 @@ class Gateway:
             raise CleanupError('Unsupported OCI operation or access mode')
         if type(params) is not dict or 'retry_strategy' in params:
             raise CleanupError('Operation parameters cannot override retry policy')
+        label = f'{mode} {service}.{operation} in {region}'
+        started = time.monotonic()
+        if self.progress is not None:
+            self.progress(f'Starting {label}')
         kwargs = dict(params, retry_strategy=self._read_retry if mode == 'read' else oci.retry.NoneRetryStrategy())
         if service == 'kms_vault' and operation == 'get_vault':
             self._vault_endpoints = {k: v for k, v in self._vault_endpoints.items()
                                      if v != params.get('vault_id')}
-        client = self.client(service, region, endpoint)
         try:
+            client = self.client(service, region, endpoint)
             response = contract[1](client, kwargs)
         except oci.exceptions.ServiceError as error:
+            if self.progress is not None:
+                self.progress(f'Failed {label} after {time.monotonic() - started:.1f}s (HTTP {error.status})')
             raise GatewayError(service, operation, error.status, error.code,
                                (error.headers or {}).get('opc-request-id')) from None
+        except CleanupError:
+            if self.progress is not None:
+                self.progress(f'Failed {label} after {time.monotonic() - started:.1f}s')
+            raise
         except Exception:
+            if self.progress is not None:
+                self.progress(f'Failed {label} after {time.monotonic() - started:.1f}s')
             raise GatewayError(service, operation) from None
         data = _normalize(response.data)
         headers = {str(k).lower(): v for k, v in response.headers.items()}
@@ -295,6 +309,8 @@ class Gateway:
             headers['__http_status__'] = status
         if service == 'kms_vault' and operation == 'get_vault':
             self._remember_vault(region, params, data)
+        if self.progress is not None:
+            self.progress(f'Completed {label} after {time.monotonic() - started:.1f}s')
         return data, headers
 
     def _remember_vault(self, region, params, vault):
