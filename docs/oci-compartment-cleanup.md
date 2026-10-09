@@ -19,6 +19,13 @@ deletions remain visible blockers.
 Use macOS or Linux with Python 3.10 or newer. The cleanup tool consists of an
 entry script and a Python package; keep them together in the layout shown below.
 
+> **OCI Cloud Shell (9 October 2026):** The Cloud Shell session used when writing
+> this note ran Python 3.9. With that version, the SDK installation succeeds but
+> this tool fails at startup, including `--help`, with
+> `TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'`.
+> Check your session's version; if it is below 3.10, run the tool on a local
+> workstation with Python 3.10 or newer.
+
 The simplest option is to clone the repository and enter its root directory:
 
 ```bash
@@ -59,7 +66,12 @@ directory; preserve it across report and deletion runs until cleanup finishes.
 This tool uses the OCI Python SDK directly and does not require the OCI
 CLI. Its supported SDK minimum is 2.187.0.
 
+Check the interpreter before installing. `python3 --version` must report 3.10 or
+newer. If your supported interpreter has a versioned name, such as `python3.11`,
+use that name instead of `python3` in **every** installation and tool command below.
+
 ```bash
+python3 --version
 python3 -m pip install -r python/requirements-compartment-cleanup.txt
 python3 python/oci_compartment_cleanup.py --help
 ```
