@@ -19,6 +19,30 @@ deletions remain visible blockers.
 Use macOS or Linux with Python 3.10 or newer. The cleanup tool consists of an
 entry script and a Python package; keep them together in the layout shown below.
 
+### Windows workstations
+
+Native Windows Python is not supported: the tool's workspace locking and durable
+file writes require macOS or Linux filesystem APIs. On Windows, use a Linux
+distribution in **WSL 2** with Python 3.10 or newer. See
+[Microsoft's WSL installation guide](https://learn.microsoft.com/en-us/windows/wsl/install).
+
+If WSL is not installed, run this in an administrator PowerShell window and
+complete the restart and Linux user setup described in that guide:
+
+```powershell
+wsl --install
+```
+
+Then open the Linux distribution's terminal. Run the remaining commands in that
+terminal, including repository download, environment creation, installation,
+authentication, and cleanup. Start in your Linux home directory with `cd ~` so
+the clone is stored there. Keep the repository, environment, and cleanup work
+directory in the [WSL Linux filesystem](https://learn.microsoft.com/en-us/windows/wsl/filesystems),
+such as `/home/<user>/`, rather than under `/mnt/c/`. The `~/.venvs/` and
+`~/.oci/config` paths below refer to your Linux home directory inside WSL.
+
+### Download the tool
+
 > **OCI Cloud Shell (9 October 2026):** The Cloud Shell session used when writing
 > this note ran Python 3.9. With that version, the SDK installation succeeds but
 > this tool fails at startup, including `--help`, with
@@ -74,19 +98,21 @@ appear with Homebrew Python on macOS or a package-managed Python on Linux.
 See the [Python packaging guidance](https://packaging.python.org/en/latest/specifications/externally-managed-environments/).
 
 From the directory containing `python/`, check that `python3 --version` reports
-3.10 or newer, then create and activate the environment:
+3.10 or newer, then create and activate the environment. The commands below
+place it in `~/.venvs/oci-compartment-cleanup`, outside the downloaded repository:
 
 ```bash
 python3 --version
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv ~/.venvs/oci-compartment-cleanup
+source ~/.venvs/oci-compartment-cleanup/bin/activate
 python3 --version
 python3 -m pip install -r python/requirements-compartment-cleanup.txt
 python3 python/oci_compartment_cleanup.py --help
 ```
 
 If your supported interpreter has a versioned name, such as `python3.11`, use
-`python3.11 --version` and `python3.11 -m venv .venv` for the first two commands.
+`python3.11 --version` and
+`python3.11 -m venv ~/.venvs/oci-compartment-cleanup` for the first two commands.
 After activation, `python3` uses the environment's interpreter. Creating a
 virtual environment with Python 3.9 does not upgrade it to Python 3.10.
 
@@ -94,7 +120,7 @@ Keep the environment active when running the report and delete commands below.
 In each new terminal session, return to the same directory and reactivate it:
 
 ```bash
-source .venv/bin/activate
+source ~/.venvs/oci-compartment-cleanup/bin/activate
 ```
 
 Install the requirements once when creating the environment; later cleanup runs
@@ -104,9 +130,15 @@ can reuse it. To leave the environment when you are done with the terminal sessi
 deactivate
 ```
 
-The `.venv/` directory holds the interpreter and installed packages. The
-`.oci-cleanup/` work directory holds the cleanup plan and journal; preserve that
-work directory until cleanup finishes, including between terminal sessions.
+The locations have different purposes:
+
+- The downloaded repository contains the scripts. Run the tool commands from
+  its root directory, which contains `python/`.
+- `~/.venvs/oci-compartment-cleanup` contains the environment and installed
+  packages. Activating it does not change your working directory.
+- `.oci-cleanup/example`, used in the examples below, is created under the
+  repository root and contains the cleanup plan and journal. Preserve the entire
+  work directory until cleanup finishes, including between terminal sessions.
 
 ### Authentication and permissions
 
