@@ -303,11 +303,35 @@ case, the saved date is labeled **last known schedule; verification failed**.
 Past scheduled times request verification now and are not shown as a future
 revisit time. Only successfully verified future schedules select the next revisit.
 
-A deleted vault cannot supply a verified key management endpoint. Its remaining
-key records require manual verification; the tool does not infer their deletion.
-An HTTP 404 also leaves removal unverified, because OCI can return it when a
-resource is absent or the caller cannot access it. See
-[OCI API errors](https://docs.oracle.com/en-us/iaas/Content/API/References/apierrors.htm).
+### Confirm resources already deleted
+
+In the normal Search report, a scheduled resource whose read returns HTTP 404,
+or a key whose vault is deleted or unavailable, receives an **exact OCID Search**
+in its recorded region. The tool displays the full OCID, resource-read failure
+and Search result. Search results depend on permissions, so zero matches alone
+never automatically mark a resource deleted. A stale Search entry can also
+remain after deletion.
+
+If you know the listed resources are already deleted, answer the additional prompt:
+
+```text
+Are ALL listed resources already deleted? Type YES to record this and continue, or press Enter to keep them unresolved:
+```
+
+Exact uppercase `YES` records your acknowledgement locally, removes those targets
+from the active map, and continues the report. Pressing Enter keeps them unresolved
+and still finishes the report. This confirmation submits no OCI deletion and does
+not replace the two confirmations required by delete mode.
+
+The journal labels these outcomes **operator-confirmed removals**, preserves their
+original attempts and schedules, and reuses the acknowledgement on later runs.
+A successful live read showing the resource still exists reopens it. Keep the same
+work directory to retain this decision. An exact Search failure or conflicting
+identity does not become an empty result or a confirmation candidate.
+
+A deleted vault cannot supply a verified key management endpoint. An HTTP 404 can
+mean absent or inaccessible; see [OCI API errors](https://docs.oracle.com/en-us/iaas/Content/API/References/apierrors.htm).
+Search visibility is described in [Overview of Search](https://docs.oracle.com/en-us/iaas/Content/Search/Concepts/queryoverview.htm).
 
 A schedule can remain pending after that date. If the current read has no date,
 the report says the UTC schedule is unknown and preserves the previous date only

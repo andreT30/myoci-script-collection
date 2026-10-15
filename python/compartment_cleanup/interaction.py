@@ -78,3 +78,15 @@ class TerminalInteraction:
                     self.show('Volume preserved by instance termination: ' + volume)
         return accepted_yes(stdin=self.stdin, stderr=self.stderr, prompt=(
             'These additional targets may be permanently deleted. Type YES to include them: '))
+
+    def confirm_removed(self, nodes):
+        self.show('These resources could not be verified by their resource APIs.')
+        self.show('An empty Search result is not a deletion guarantee.')
+        self.show('Confirm only if you know every listed resource is already deleted.')
+        self.show('This records your acknowledgement locally and continues; it submits no OCI deletion.')
+        for node in nodes:
+            self.show(f'{node.display_name or node.key} | {node.resource_type} | {node.region}')
+            self.show('OCID: ' + node.key)
+            self.show('Owner: ' + node.compartment_id)
+        return accepted_yes(stdin=self.stdin, stderr=self.stderr, prompt=(
+            'Are ALL listed resources already deleted? Type YES to record this and continue, or press Enter to keep them unresolved: '))

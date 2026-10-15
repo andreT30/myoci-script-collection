@@ -11,6 +11,7 @@ import sys
 from .discovery import discover
 from .inventory import collect_inventory, reconcile_inventory_state
 from .guided import execute_guided
+from .removal_confirmation import reconcile_removals
 from .executor import cleanup_result, preserve_report_members, reconcile_report
 from .gateway import build_gateway, discover_scope
 from .graph import validate_scope
@@ -163,6 +164,10 @@ def main(argv: list[str] | None = None) -> int:
                 workspace.save_state(state)
                 if args.exhaustive_discovery:
                     reconcile_report(fresh, state, workspace, gateway, registry)
+                if not args.exhaustive_discovery:
+                    reconcile_removals(gateway, fresh, state, TerminalInteraction())
+                    workspace.save_state(state)
+                    workspace.save_plan(fresh)
                 text = render_report(fresh, state)
                 workspace.save_report(text)
                 print(_terminal_report(fresh, state, args.verbose), end='')

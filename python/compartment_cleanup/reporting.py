@@ -126,6 +126,9 @@ def render_report(plan: Plan, state: State, *, now=None) -> str:
     lines.append('Schedule verification failures: ' + str(len(failures)))
     lines.extend(['', 'Pending deletions and retained journal records'])
     records = resource_records(state)
+    confirmed = sum(r.get('status') == 'deleted' and r.get('completion_basis') == 'operator_confirmation'
+                    for r in records.values())
+    lines.append(f'Operator-confirmed removals: {confirmed}; local acknowledgements, not API deletion proofs.')
     # Discovery already contains typed service-confirmed schedules. Show them on
     # an initial report before an executor journal has recorded the first read.
     for key, node in plan.nodes.items():
@@ -149,7 +152,10 @@ def render_report(plan: Plan, state: State, *, now=None) -> str:
             if timestamp and not failed:
                 pending.append(timestamp)
         if key not in plan.nodes:
-            lines.append(f'  {_display(key)}: absent from refreshed map; status {_display(record.get("status", "unresolved"))}; authoritative verification required. History preserved.')
+            if record.get('completion_basis') == 'operator_confirmation' and record.get('status') == 'deleted':
+                lines.append(f'  {_display(key)}: operator confirmed already deleted; acknowledgement and history preserved.')
+            else:
+                lines.append(f'  {_display(key)}: absent from refreshed map; status {_display(record.get("status", "unresolved"))}; authoritative verification required. History preserved.')
             if record.get('errors'):
                 lines.append('    errors: ' + _display(json.dumps(record['errors'], ensure_ascii=False)))
     groups=list(bulk_attempt_records(state))
@@ -240,6 +246,10 @@ def render_terminal_summary(plan: Plan, state: State, *, width: int = 100, now=N
     if len(grouped_errors) > 8:
         line(f'  … {len(grouped_errors) - 8} more failure groups; see report.txt')
 
+    confirmed = sum(r.get('status') == 'deleted' and r.get('completion_basis') == 'operator_confirmation'
+                    for r in records.values())
+    line(f'Operator-confirmed removals: {confirmed}')
+
     names = Counter(node.display_name for node in resources if node.display_name)
     pending = []
     pending_count = 0
@@ -278,5 +288,7 @@ def render_terminal_summary(plan: Plan, state: State, *, width: int = 100, now=N
     if orphans:
         line(f'Retained journal history absent from inventory: {len(orphans)}')
         for key, record in orphans[:8]:
-            line(f'  {short(key)}: {_display(record.get("status", "unresolved"))}; history preserved')
+            status = ('operator confirmed deleted' if record.get('completion_basis') == 'operator_confirmation'
+                      and record.get('status') == 'deleted' else record.get('status', 'unresolved'))
+            line(f'  {short(key)}: {_display(status)}; history preserved')
     return '\n'.join(lines) + '\n'

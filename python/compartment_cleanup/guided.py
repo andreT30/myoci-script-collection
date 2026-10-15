@@ -16,6 +16,7 @@ from .graph import validate_scope, compute_depths
 from .journal import attempt_history, resource_records, bulk_attempt_records
 from .model import CleanupError, Edge, Node, Observation, plan_to_dict, state_to_dict
 from .reporting import render_report
+from .removal_confirmation import retire_confirmed
 
 
 def _safe(value):
@@ -204,9 +205,10 @@ def execute_guided(plan, state, workspace, gateway, registry, supplied_parent,
         current_scope, moved = _scope_now(gateway, plan)
         if moved & set(plan.compartments):
             raise CleanupError('Compartment hierarchy changed; refresh the report before deletion')
+        retire_confirmed(plan, state)
         state.records.setdefault(plan.parent_id, {'attempts': []}).update(status='retained')
         state.records[plan.parent_id].pop('verification', None)
-        _save(workspace, state)
+        _save(workspace, state, plan)
         ordering_nodes = {k: registry.classify(n) if registry.handler_for(n) is not None else n
                           for k, n in plan.nodes.items()}
         depths, _ = compute_depths(ordering_nodes, plan.edges)
