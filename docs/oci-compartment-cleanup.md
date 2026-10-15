@@ -297,6 +297,18 @@ An already pending resource is inspected without rescheduling. For example:
 Cannot finish cleanup: <resource OCID> is pending deletion until <UTC timestamp>; rerun after that time and verify its removal.
 ```
 
+The summary separates **schedule verification failures** from inventory coverage
+failures. Search can succeed while a targeted key or secret read fails. In that
+case, the saved date is labeled **last known schedule; verification failed**.
+Past scheduled times request verification now and are not shown as a future
+revisit time. Only successfully verified future schedules select the next revisit.
+
+A deleted vault cannot supply a verified key management endpoint. Its remaining
+key records require manual verification; the tool does not infer their deletion.
+An HTTP 404 also leaves removal unverified, because OCI can return it when a
+resource is absent or the caller cannot access it. See
+[OCI API errors](https://docs.oracle.com/en-us/iaas/Content/API/References/apierrors.htm).
+
 A schedule can remain pending after that date. If the current read has no date,
 the report says the UTC schedule is unknown and preserves the previous date only
 in history. An asynchronous operation without a schedule is displayed as in

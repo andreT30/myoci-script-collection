@@ -21,7 +21,34 @@ def _utc(value):
         return None
 
 
-def render_report(plan: Plan, state: State) -> str:
+def _schedule_failure(plan, node):
+    value = node.metadata.get('schedule_verification') if node else None
+    return (value if isinstance(value, dict) and value.get('status') == 'failed'
+            and value.get('observed_at') == plan.created_at else None)
+
+
+def _schedule_label(timestamp, failed, now):
+    text = timestamp
+    if failed:
+        text += ' (last known schedule; verification failed)'
+    if datetime.fromisoformat(timestamp.replace('Z', '+00:00')) <= now:
+        text += '; scheduled time has passed; verify removal now'
+    return text
+
+
+def _revisit(dates, now):
+    future = [date for date in dates
+              if datetime.fromisoformat(date.replace('Z', '+00:00')) > now]
+    if future:
+        earliest = min(future, key=lambda date: datetime.fromisoformat(date.replace('Z', '+00:00')))
+        return 'Next known revisit time: ' + earliest + '; verify removal on rerun.'
+    if dates:
+        return 'Scheduled times have passed; verify removal now. Elapsed time does not prove deletion.'
+    return None
+
+
+def render_report(plan: Plan, state: State, *, now=None) -> str:
+    now = now or datetime.now(timezone.utc)
     depths, blockers = compute_depths(plan.nodes, plan.edges)
     lines = [f'OCI cleanup; retained parent: {_display(plan.parent_id)}',
              f'Tenancy: {_display(plan.tenancy_id)}',
@@ -95,6 +122,8 @@ def render_report(plan: Plan, state: State) -> str:
         lines.append('  No discovery probes recorded; coverage is unverified.')
     for probe in plan.probes:
         lines.append(f'  {_display(probe.service)} / {_display(probe.region)} / {_display(probe.compartment_id)}: {_display(probe.status)}; {_display(probe.detail)}')
+    failures = [n for n in plan.nodes.values() if _schedule_failure(plan, n)]
+    lines.append('Schedule verification failures: ' + str(len(failures)))
     lines.extend(['', 'Pending deletions and retained journal records'])
     records = resource_records(state)
     # Discovery already contains typed service-confirmed schedules. Show them on
@@ -105,14 +134,19 @@ def render_report(plan: Plan, state: State) -> str:
     for key, record in sorted(records.items()):
         if record.get('status') == 'pending':
             timestamp = _utc(record.get('scheduled_at'))
+            failed = _schedule_failure(plan, plan.nodes.get(key))
             if timestamp:
-                lines.append(f'  Cannot finish cleanup: {_display(key)} is pending deletion until {timestamp}; rerun after that time and verify its removal.')
+                label = _schedule_label(timestamp, failed, now)
+                if not failed and datetime.fromisoformat(timestamp.replace('Z', '+00:00')) > now:
+                    lines.append(f'  Cannot finish cleanup: {_display(key)} is pending deletion until {timestamp}; rerun after that time and verify its removal.')
+                else:
+                    lines.append(f'  Cannot finish cleanup: {_display(key)} | {label}.')
             elif (record.get('lifecycle_state') in ('PENDING_DELETION', 'SCHEDULING_DELETION')
                   or (plan.nodes.get(key) and plan.nodes[key].action == 'schedule')):
                 lines.append(f'  Cannot finish cleanup: {_display(key)} has a pending scheduled deletion with unknown UTC schedule (verification required); rerun to verify its removal.')
             else:
                 lines.append(f'  Cannot finish cleanup: {_display(key)} has an asynchronous deletion in progress; rerun to verify its removal.')
-            if timestamp:
+            if timestamp and not failed:
                 pending.append(timestamp)
         if key not in plan.nodes:
             lines.append(f'  {_display(key)}: absent from refreshed map; status {_display(record.get("status", "unresolved"))}; authoritative verification required. History preserved.')
@@ -125,17 +159,18 @@ def render_report(plan: Plan, state: State) -> str:
             lines.append(f'  {_display(attempt["attempt_id"])} | {_display(attempt.get("operation", "unknown"))} | status: {_display(attempt.get("status", "unresolved"))}')
             for key,status in sorted(attempt.get('resource_status',{}).items()):
                 lines.append(f'    {_display(key)}: {_display(status)}')
-    if pending:
-        earliest = min(pending, key=lambda value: datetime.fromisoformat(value.replace('Z', '+00:00')))
-        lines.append('Next known revisit time: ' + earliest + '; an earliest known condition, not a promise of completion.')
+    revisit = _revisit(pending, now)
+    if revisit:
+        lines.append(revisit)
     return '\n'.join(lines) + '\n'
 
 
-def render_terminal_summary(plan: Plan, state: State, *, width: int = 100) -> str:
+def render_terminal_summary(plan: Plan, state: State, *, width: int = 100, now=None) -> str:
     """Readable counts and all pending dates; detailed identities stay in artifacts."""
     from collections import Counter
     import textwrap
 
+    now = now or datetime.now(timezone.utc)
     width = max(40, int(width))
     lines = []
 
@@ -180,6 +215,16 @@ def render_terminal_summary(plan: Plan, state: State, *, width: int = 100) -> st
         line(f'  {_display(service)} / {_display(region)}: {_display(status)} ({count}); {detail}')
     if len(grouped) > 8:
         line(f'  … {len(grouped) - 8} more failure groups; see report.txt')
+    schedule_failures = [node for node in resources if _schedule_failure(plan, node)]
+    line(f'Schedule verification failures: {len(schedule_failures)}')
+    for node in schedule_failures[:8]:
+        failure = _schedule_failure(plan, node)
+        status = failure.get('http_status')
+        line('  ' + (node.display_name or short(node.key)) + ' | ' + node.resource_type
+             + ': ' + _display(failure.get('detail', 'Targeted schedule verification failed'))
+             + (f' (HTTP {status})' if status else ''))
+    if len(schedule_failures) > 8:
+        line(f'  … {len(schedule_failures) - 8} more; see report.txt')
     unsupported = [node for node in resources if not node.handler and node.action not in ('retain', 'cascade')]
     line(f'Missing deletion handlers: {len(unsupported)}')
     unsupported_types = sorted(Counter(node.resource_type for node in unsupported).items())
@@ -206,7 +251,8 @@ def render_terminal_summary(plan: Plan, state: State, *, width: int = 100) -> st
         if record.get('status') != 'pending' and not implicit:
             continue
         stamp = _utc(record.get('scheduled_at') if not implicit else node.metadata.get('scheduled_at'))
-        if stamp:
+        failed_schedule = _schedule_failure(plan, node)
+        if stamp and not failed_schedule:
             known_dates.append(stamp)
         name = (node.display_name if node else record.get('display_name')) or short(key)
         kind = node.resource_type if node else record.get('resource_type', 'unknown type')
@@ -215,7 +261,7 @@ def render_terminal_summary(plan: Plan, state: State, *, width: int = 100) -> st
             name += ' [' + short(key) + ']'
         identity = f'{name} | {kind}' + (f' | {region}' if region else '')
         scheduled = (node and node.action == 'schedule') or record.get('lifecycle_state') in {'PENDING_DELETION', 'SCHEDULING_DELETION'}
-        date = stamp or ('unknown UTC schedule; verification required' if scheduled or implicit else 'asynchronous deletion; verification required')
+        date = (_schedule_label(stamp, failed_schedule, now) if stamp else None) or ('unknown UTC schedule; verification required' if scheduled or implicit else 'asynchronous deletion; verification required')
         pending_count += 1
         pending.append(identity + ' | ' + date)
         if node is None:
@@ -225,9 +271,9 @@ def render_terminal_summary(plan: Plan, state: State, *, width: int = 100) -> st
         line('Cleanup cannot finish until these resources are confirmed deleted.')
     for entry in pending:
         line('  ' + entry)
-    if known_dates:
-        earliest = min(known_dates, key=lambda value: datetime.fromisoformat(value.replace('Z', '+00:00')))
-        line('Next known revisit time: ' + earliest + '; verify removal on rerun.')
+    revisit = _revisit(known_dates, now)
+    if revisit:
+        line(revisit)
     orphans = [(key, record) for key, record in records.items() if key not in plan.nodes and record.get('status') != 'pending']
     if orphans:
         line(f'Retained journal history absent from inventory: {len(orphans)}')

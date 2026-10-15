@@ -11,7 +11,7 @@ import re
 
 import oci
 
-from .gateway import discover_scope
+from .gateway import discover_scope, GatewayError
 from .graph import compute_depths, validate_scope
 from .journal import resource_records
 from .model import CleanupError, Edge, Node, Plan, Probe, State, Observation, SCHEMA_VERSION, _json_value
@@ -94,7 +94,7 @@ def _known_pending(node, record):
 
 def _refresh_schedule(gateway, node, scope, observed_at):
     """Only known scheduled identities receive target-specific service reads."""
-    node = replace(node, metadata={k:deepcopy(v) for k,v in node.metadata.items() if k != 'schedule_observation'})
+    node = replace(node, metadata={k:deepcopy(v) for k,v in node.metadata.items() if k not in ('schedule_observation', 'schedule_verification')})
     contract = _SCHEDULE_READS.get(node.resource_type)
     if contract is None:
         return _blocked(node, 'Known pending identity has no targeted schedule read')
@@ -107,6 +107,8 @@ def _refresh_schedule(gateway, node, scope, observed_at):
             vault, _ = gateway.read('kms_vault', node.region, 'get_vault', {'vault_id':vault_id})
             if vault.get('id') != vault_id or vault.get('compartment_id') not in scope:
                 raise CleanupError('Known key vault is outside live scope')
+            if vault.get('lifecycle_state') == 'DELETED':
+                raise CleanupError('Owning vault is deleted; key deletion cannot be verified')
             endpoint = vault.get('management_endpoint')
             # Gateway binds this endpoint to the preceding authoritative vault
             # response and validates its region/realm. Search endpoints are unused.
@@ -128,8 +130,14 @@ def _refresh_schedule(gateway, node, scope, observed_at):
         metadata['scheduled_at'] = when
         metadata['schedule_observation'] = {'lifecycle_state':lifecycle, 'scheduled_at':when, 'observed_at':observed_at}
         return replace(node, lifecycle_state=lifecycle, metadata=metadata)
-    except Exception:
-        return _blocked(node, 'Known schedule lacks authoritative in-scope verification')
+    except Exception as error:
+        detail = (str(error) if type(error) is CleanupError else
+                  'Targeted schedule read failed; previous schedule is unverified')
+        failure = {'status':'failed', 'observed_at':observed_at, 'detail':detail}
+        if isinstance(error, GatewayError):
+            failure['http_status'] = error.status
+        node = replace(node, metadata=dict(node.metadata, schedule_verification=failure))
+        return _blocked(node, detail)
 
 
 def collect_inventory(gateway, parent_id: str, registry, previous: Plan | None = None, state=None) -> Plan:
