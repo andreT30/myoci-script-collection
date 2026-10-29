@@ -5,15 +5,13 @@ policy analysis, bulk tag updates, and Linux 9 SSH recovery.
 
 ## Prerequisites
 
-All tools expect an authenticated and configured [OCI CLI](https://docs.oracle.com/en-us/iaas/Content/API/SDKDocs/cliinstall.htm)
+The existing inventory, lookup, tag and Bash tools expect an authenticated and configured [OCI CLI](https://docs.oracle.com/en-us/iaas/Content/API/SDKDocs/cliinstall.htm)
 and an identity with permission to read or modify the resources involved.
 
 - `python3` is required by every Python tool and by the policy hierarchy tool.
 - `jq` is required by the Bash tools.
 - The OCI CLI configuration defaults to `~/.oci/config` and the `DEFAULT`
   profile unless the tool or environment specifies otherwise.
-- CSV, TSV, generated bulk-tag JSON, Python caches, local environments, and
-  tests are intentionally excluded from Git by `.gitignore`.
 
 Make the scripts executable after cloning if the filesystem did not preserve
 their modes:
