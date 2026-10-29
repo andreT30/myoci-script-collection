@@ -25,3 +25,9 @@ bulkedit.json
 
 # Local resumable cleanup artifacts
 .oci-cleanup/
+
+# Internal-only tooling
+/python/oci_compartment_cleanup.py
+/python/compartment_cleanup/
+/python/requirements-compartment-cleanup.txt
+/docs/oci-compartment-cleanup.md
