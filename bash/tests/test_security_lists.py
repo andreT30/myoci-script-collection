@@ -1,6 +1,7 @@
 """Exercise security-list copying locally without access to OCI."""
 
 import json
+import copy
 import os
 from pathlib import Path
 import subprocess
@@ -125,6 +126,27 @@ class SecurityListTests(unittest.TestCase):
                 request = json.loads((directory / filename).read_text())
                 self.assertEqual(request["ingressSecurityRules"], [])
                 self.assertEqual(request["egressSecurityRules"], [])
+
+    def test_service_network_destination_keeps_service_type(self):
+        source = copy.deepcopy(SOURCE)
+        source["data"]["egress-security-rules"].append({
+            "destination": "all-fra-services-in-oracle-services-network",
+            "destination-type": "SERVICE_CIDR_BLOCK",
+            "is-stateless": False,
+            "protocol": "all",
+        })
+        for script in SCRIPTS:
+            with self.subTest(script=script):
+                result, directory, _ = self.run_script(script, source=source)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                filename = "submitted.json" if script == SCRIPTS[0] else "destination-security-list.json"
+                request = json.loads((directory / filename).read_text())
+                self.assertEqual(request["egressSecurityRules"][-1], {
+                    "destination": "all-fra-services-in-oracle-services-network",
+                    "destinationType": "SERVICE_CIDR_BLOCK",
+                    "isStateless": False,
+                    "protocol": "all",
+                })
 
     def test_failed_reads_or_malformed_rules_never_create_or_export(self):
         for script in SCRIPTS:

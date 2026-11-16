@@ -521,6 +521,18 @@ their temporary working directories on exit.
 
 ### Validate the security-list scripts locally
 
+If creation reports that `all-fra-services-in-oracle-services-network` is an
+invalid CIDR, inspect the exported rule. It must contain
+`"destinationType": "SERVICE_CIDR_BLOCK"`. OCI defaults to `CIDR_BLOCK` when the
+destination type is omitted. See the
+[egress rule reference](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.EgressSecurityRule.html#oci.core.models.EgressSecurityRule.destination_type).
+
+Exports containing abbreviated keys such as `destinationT`, `sourceT`, `isS`,
+`tcpO`, or `destinationPR` came from a broken key conversion. Regenerate them
+using the current preview script before running the create command. Correct
+keys include `destinationType`, `sourceType`, `isStateless`, `tcpOptions`, and
+`destinationPortRange`; fixing only the service type leaves port options broken.
+
 These checks use simulated OCI responses and do not access a tenancy:
 
 ```bash
