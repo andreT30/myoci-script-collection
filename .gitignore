@@ -24,6 +24,8 @@ resources.json
 bulkedit.json
 source-route-table.json
 destination-route-table.json
+source-security-list.json
+destination-security-list.json
 
 # Local resumable cleanup artifacts
 .oci-cleanup/

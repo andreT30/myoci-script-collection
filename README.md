@@ -1,7 +1,8 @@
 # OCI script collection
 
 Utilities for OCI resource inventory, service-limit lookup, VM reporting, IAM
-policy analysis, route-table copying, bulk tag updates, and Linux 9 SSH recovery.
+policy analysis, route-table and security-list copying, bulk tag updates, and
+Linux 9 SSH recovery.
 
 ## Prerequisites
 
@@ -10,6 +11,7 @@ and an identity with permission to read or modify the resources involved.
 
 - `python3` is required by every Python tool and by the policy hierarchy tool.
 - `jq` is required by the Bash tools.
+  Security-list copying and preview require `jq` 1.6 or later.
 - The OCI CLI configuration defaults to `~/.oci/config` and the `DEFAULT`
   profile unless the tool or environment specifies otherwise.
 
@@ -30,6 +32,8 @@ chmod +x bash/*.sh python/*.py
 | `bash/count_policy_hierarchy_statements.sh` | Count IAM policy statements along every compartment path | No |
 | [`bash/copy_route_table.sh`](bash/copy_route_table.sh) | Copy source route rules into a new destination route table, remapping NAT and service gateways | **Yes** |
 | [`bash/preview_route_table.sh`](bash/preview_route_table.sh) | Read a source route table and save a proposed creation request | No |
+| [`bash/copy_security_list.sh`](bash/copy_security_list.sh) | Copy ingress and egress rules into a new destination security list | **Yes** |
+| [`bash/preview_security_list.sh`](bash/preview_security_list.sh) | Read a source security list and save a proposed creation request | No |
 | `python/bulk_edit_tags_single_compartment.py` | Apply a defined tag to supported resources in one compartment | **Yes** |
 | `oci_linux9_opc_ssh_recovery.md` | Recovery guide for the `opc` user's SSH access | Procedural guide |
 
@@ -453,6 +457,74 @@ These checks use simulated OCI responses and do not access a tenancy:
 
 ```bash
 bash -n bash/copy_route_table.sh bash/preview_route_table.sh
+python3 -m unittest discover -s bash/tests -v
+```
+
+## Copy or preview a security list
+
+Both security-list scripts copy ingress and egress rules, including descriptions,
+TCP/UDP port ranges, ICMP options, and stateless flags. They convert OCI CLI output
+keys to camelCase input keys recursively and remove null object values while
+preserving `false`, zero, and empty rule arrays. Missing or non-array ingress or
+egress rules cause the scripts to stop before creating a resource or exporting
+a request.
+
+Edit the configuration block in the script you plan to run, or export these
+four variables after replacing the placeholders. No original resource OCIDs
+are stored in either script.
+
+```bash
+export SOURCE_SL="REPLACE_ME_SOURCE_SECURITY_LIST_OCID"
+export DEST_COMPARTMENT="REPLACE_ME_DESTINATION_COMPARTMENT_OCID"
+export DEST_VCN="REPLACE_ME_DESTINATION_VCN_OCID"
+export DEST_NAME="sl-fra-lz01-dev-db-01"
+```
+
+The scripts use the current OCI CLI context for both source and destination.
+They copy rules only; they do not copy tags, rewrite source or destination CIDRs,
+or attach the security list to a subnet. Review the rules for the destination
+network before creating the list.
+
+### Preview security-list creation
+
+```bash
+bash/preview_security_list.sh
+```
+
+The preview reads the source, saves `source-security-list.json` and
+`destination-security-list.json` in the current directory, and prints the proposed
+request and ingress/egress rule counts. It does not change OCI resources. Existing
+files with those names are overwritten. New files are accessible only to their
+owner; both names are ignored by Git.
+
+The script includes this commented command for use after reviewing the JSON:
+
+```bash
+oci network security-list create \
+  --from-json file://destination-security-list.json \
+  --wait-for-state AVAILABLE
+```
+
+See the [OCI CLI security-list create reference](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/network/security-list/create.html)
+for the JSON input format and creation options.
+
+### Create the destination security list directly
+
+```bash
+bash/copy_security_list.sh
+```
+
+This version prints the proposed request, immediately creates the security list,
+waits for `AVAILABLE`, and prints its OCID. Each run creates a new list. If the wait
+times out, inspect OCI before rerunning to avoid duplicates. Both versions remove
+their temporary working directories on exit.
+
+### Validate the security-list scripts locally
+
+These checks use simulated OCI responses and do not access a tenancy:
+
+```bash
+bash -n bash/copy_security_list.sh bash/preview_security_list.sh
 python3 -m unittest discover -s bash/tests -v
 ```
 
