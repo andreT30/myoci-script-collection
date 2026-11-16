@@ -1,7 +1,7 @@
 # OCI script collection
 
 Utilities for OCI resource inventory, service-limit lookup, VM reporting, IAM
-policy analysis, bulk tag updates, and Linux 9 SSH recovery.
+policy analysis, route-table copying, bulk tag updates, and Linux 9 SSH recovery.
 
 ## Prerequisites
 
@@ -28,6 +28,8 @@ chmod +x bash/*.sh python/*.py
 | `python/oci_limit_lookup.py` | Look up service limits, usage, and available capacity | No |
 | `bash/list_all_vms_in_tenancy.sh` | List VM details across all subscribed regions | No |
 | `bash/count_policy_hierarchy_statements.sh` | Count IAM policy statements along every compartment path | No |
+| [`bash/copy_route_table.sh`](bash/copy_route_table.sh) | Copy source route rules into a new destination route table, remapping NAT and service gateways | **Yes** |
+| [`bash/preview_route_table.sh`](bash/preview_route_table.sh) | Read a source route table and save a proposed creation request | No |
 | `python/bulk_edit_tags_single_compartment.py` | Apply a defined tag to supported resources in one compartment | **Yes** |
 | `oci_linux9_opc_ssh_recovery.md` | Recovery guide for the `opc` user's SSH access | Procedural guide |
 
@@ -383,6 +385,76 @@ KEEP_TMPDIR=false \
 
 Progress and temporary-file paths are written to standard error. The TSV report
 is written to standard output and sorted by descending path statement count.
+
+## Copy or preview a route table
+
+Both route-table scripts read a source route table, exclude `LOCAL` routes,
+replace the configured NAT and service gateway IDs, and preserve other route
+targets. They stop if either old gateway ID is absent from the non-local rules.
+Descriptions are retained when present, and legacy `cidr-block` values are
+accepted as destinations.
+
+Edit the configuration block in the script you plan to run, or export all eight
+variables below. Defaults use `REPLACE_ME` placeholders; empty or unconfigured
+values cause the script to stop before calling OCI.
+
+```bash
+export SOURCE_RT="REPLACE_ME_SOURCE_ROUTE_TABLE_OCID"
+export DEST_COMPARTMENT="REPLACE_ME_DESTINATION_COMPARTMENT_OCID"
+export DEST_VCN="REPLACE_ME_DESTINATION_VCN_OCID"
+export DEST_NAME="rt-fra-lz01-dev-db"
+export OLD_NAT="REPLACE_ME_SOURCE_NAT_GATEWAY_OCID"
+export NEW_NAT="REPLACE_ME_DESTINATION_NAT_GATEWAY_OCID"
+export OLD_SGW="REPLACE_ME_SOURCE_SERVICE_GATEWAY_OCID"
+export NEW_SGW="REPLACE_ME_DESTINATION_SERVICE_GATEWAY_OCID"
+```
+
+Use the OCI CLI configuration, profile, authentication, and region environment
+settings appropriate to the resources. Both scripts use the same OCI CLI context
+for source and destination. Any unchanged route targets must also be valid for
+the destination VCN. The scripts copy rules only; they do not copy tags or attach
+the new table to a subnet. Repeated creation runs create additional route tables.
+
+### Preview without changing OCI resources
+
+```bash
+bash/preview_route_table.sh
+```
+
+The preview saves `source-route-table.json` and `destination-route-table.json`
+in the current directory and prints both. Existing files with those names are
+overwritten. New files are readable and writable only by their owner; both names
+are ignored by Git. The script ends with a commented creation command that you
+can run manually after reviewing the proposed request:
+
+```bash
+oci network route-table create \
+  --from-json file://destination-route-table.json \
+  --wait-for-state AVAILABLE
+```
+
+The JSON request uses the camelCase keys required by
+[`--from-json`](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/network/route-table/create.html).
+
+### Create the destination route table directly
+
+```bash
+bash/copy_route_table.sh
+```
+
+This version prints the transformed rules, immediately creates the destination
+route table, waits for `AVAILABLE`, and prints its OCID. If creation succeeds but
+the wait times out, inspect OCI before rerunning to avoid creating a duplicate.
+Both scripts remove their temporary working directories on exit.
+
+### Local validation
+
+These checks use simulated OCI responses and do not access a tenancy:
+
+```bash
+bash -n bash/copy_route_table.sh bash/preview_route_table.sh
+python3 -m unittest discover -s bash/tests -v
+```
 
 ## Bulk-edit defined tags in one compartment
 

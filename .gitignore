@@ -22,6 +22,8 @@ venv/
 *.tsv
 resources.json
 bulkedit.json
+source-route-table.json
+destination-route-table.json
 
 # Local resumable cleanup artifacts
 .oci-cleanup/
